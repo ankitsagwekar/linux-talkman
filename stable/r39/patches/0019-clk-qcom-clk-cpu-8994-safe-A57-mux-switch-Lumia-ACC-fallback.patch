@@ -1,0 +1,181 @@
+From: Claude <noreply@anthropic.com>
+Subject: [PATCH] clk: qcom: clk-cpu-8994: Lumia stability fixes
+
+Switching an A57 cluster mux while an A57 core enters or leaves WFI hangs
+the cluster (the 3.10 driver works around it with its "low power mux
+switch" IPIs). Do the A57 mux writes under stop_machine().
+
+The boot firmware can leave an idle PLL with its enable bits set but no
+usable output (Lumia 950 A57 PLL1): switching onto it hangs the cluster.
+Switch idle PLLs off at probe so the first use always relocks them.
+
+Back-to-back PLL relocks and mux switches hang the phone within the first
+cpufreq transitions; give each one 10 ms to settle (module parameter
+settle_us).
+
+The A57 ACC registers are secure-only and the Lumia secure firmware rejects
+qcom_scm_io_writel() with -EOPNOTSUPP (a direct write hangs). Warn once and
+carry on; without the ACC the A57 is only stable up to 768 MHz.
+
+---
+--- a/drivers/clk/qcom/clk-cpu-8994.c
++++ b/drivers/clk/qcom/clk-cpu-8994.c
+@@ -14,6 +14,7 @@
+ #include <linux/clk-provider.h>
+ #include <linux/delay.h>
+ #include <linux/firmware/qcom/qcom_scm.h>
++#include <linux/stop_machine.h>
+ #include <linux/io.h>
+ #include <linux/mfd/syscon.h>
+ #include <linux/module.h>
+@@ -78,9 +79,44 @@
+ #define ACC_A57_TYPE4		0x0b
+ 
+ static DEFINE_SPINLOCK(cpu_8994_mux_lock);
++
++/* Set once the secure world refuses the A57 ACC writes (Lumia firmware). */
++static bool a57_acc_unsupported;
++
++/*
++ * Settle time after every PLL relock and cluster mux switch. Back-to-back
++ * switching without it hangs the phone within the first cpufreq transitions
++ * (the 3.10 driver gets this spacing implicitly); 10 ms is tested stable.
++ */
++static unsigned int settle_us = 10000;
++module_param(settle_us, uint, 0644);
++
++static void clk_cpu_8994_settle(void)
++{
++	if (settle_us)
++		usleep_range(settle_us, settle_us + settle_us / 2);
++}
++
++struct cpu_8994_mux_write {
++	struct regmap *map;
++	unsigned int reg, mask, val;
++	int ret;
++};
++
++static int clk_cpu_8994_mux_write_fn(void *data)
++{
++	struct cpu_8994_mux_write *w = data;
++
++	w->ret = regmap_update_bits(w->map, w->reg, w->mask, w->val);
++	/* Ensure the switch went through; hardware mandated delay */
++	mb();
++	udelay(5);
++	return 0;
++}
+ static phys_addr_t a57_mux_phys;
+ static struct clk_regmap_mux a53_hf_mux;
+ static struct clk_regmap_mux a57_hf_mux;
++static struct clk_regmap_mux a57_lf_mux;
+ static struct device *cpu_8994_dev;
+ static struct clk *cpu_8994_bimc;
+ static unsigned long a53_cpu_rate;
+@@ -373,6 +409,7 @@
+ 			clk_cpu_8994_pll_enable(pll);
+ 	}
+ 	spin_unlock_irqrestore(&pll->lock, flags);
++	clk_cpu_8994_settle();
+ 
+ 	return ret;
+ }
+@@ -446,7 +483,22 @@
+ 	u32 t1_3 = pll_early ? ACC_A57_HIGH : ACC_A57_LOW;
+ 	int ret;
+ 
++	if (a57_acc_unsupported)
++		return 0;
++
+ 	ret = qcom_scm_io_writel(a57_mux_phys + ACC_TYPE1, t1_3);
++	if (ret == -EOPNOTSUPP) {
++		/*
++		 * The ACC registers are secure-only and the Lumia (Microsoft)
++		 * secure firmware has no io-write call. The A57 then runs with
++		 * the firmware's ACC setting, which is only stable up to
++		 * 768 MHz (960 MHz hangs under sustained load), so the OPP
++		 * table must stop there.
++		 */
++		pr_warn_once("clk-cpu-8994: secure world cannot program the A57 ACC; keep the A57 at or below 768 MHz\n");
++		a57_acc_unsupported = true;
++		return 0;
++	}
+ 	if (ret)
+ 		return ret;
+ 	ret = qcom_scm_io_writel(a57_mux_phys + ACC_TYPE2, t1_3);
+@@ -504,10 +556,28 @@
+ 			return ret;
+ 	}
+ 
+-	spin_lock_irqsave(&cpu_8994_mux_lock, flags);
+-	ret = regmap_update_bits(clkr->regmap, mux->reg, mask,
+-				 index << mux->shift);
+-	spin_unlock_irqrestore(&cpu_8994_mux_lock, flags);
++	clk_cpu_8994_settle();
++	if (hw == &a57_hf_mux.clkr.hw || hw == &a57_lf_mux.clkr.hw) {
++		/*
++		 * 3.10 "low power mux switch": an A57 cluster mux may only be
++		 * switched while no A57 core enters or leaves WFI, or the
++		 * cluster hangs. Write it under stop_machine(), with every other
++		 * CPU spinning with IRQs off.
++		 */
++		struct cpu_8994_mux_write w = {
++			.map = clkr->regmap, .reg = mux->reg, .mask = mask,
++			.val = index << mux->shift,
++		};
++
++		stop_machine(clk_cpu_8994_mux_write_fn, &w, NULL);
++		ret = w.ret;
++	} else {
++		spin_lock_irqsave(&cpu_8994_mux_lock, flags);
++		ret = regmap_update_bits(clkr->regmap, mux->reg, mask,
++					 index << mux->shift);
++		spin_unlock_irqrestore(&cpu_8994_mux_lock, flags);
++	}
++	clk_cpu_8994_settle();
+ 	if (ret)
+ 		return ret;
+ 
+@@ -704,6 +774,26 @@
+ 	},
+ };
+ 
++/*
++ * The boot firmware can leave a PLL that no cluster runs from with its
++ * enable bits set but not producing a usable clock (seen on the Lumia 950 A57
++ * PLL1: switching the LF mux onto it hangs the cluster). Switch such idle
++ * PLLs off at probe, so the first switch onto one always relocks it.
++ */
++static void clk_cpu_8994_park_idle_plls(u32 mux, struct clk_cpu_8994_pll *pll0,
++					struct clk_cpu_8994_pll *pll1)
++{
++	u32 hf = (mux >> HF_MUX_SHIFT) & GENMASK(MUX_WIDTH - 1, 0);
++	u32 lf = (mux >> LF_MUX_SHIFT) & GENMASK(MUX_WIDTH - 1, 0);
++	bool use0 = hf == 3 || (hf == 0 && lf == 2);
++	bool use1 = hf == 1 || (hf == 0 && lf == 1);
++
++	if (!use0)
++		clk_cpu_8994_pll_disable(pll0);
++	if (!use1)
++		clk_cpu_8994_pll_disable(pll1);
++}
++
+ static void clk_cpu_8994_pll1_init_hw(struct clk_cpu_8994_pll *pll)
+ {
+ 	if (clk_cpu_8994_pll_enabled(pll))
+@@ -883,6 +973,14 @@
+ 	if (ret)
+ 		return ret;
+ 
++	{
++		unsigned int a53_mux = 0;
++
++		regmap_read(apcs, MUX_OFFSET, &a53_mux);
++		clk_cpu_8994_park_idle_plls(a53_mux, &a53_pll0, &a53_pll1);
++		clk_cpu_8994_park_idle_plls(readl_relaxed(c1_mux + MUX_OFFSET),
++					    &a57_pll0, &a57_pll1);
++	}
+ 	clk_cpu_8994_pll1_init_hw(&a53_pll1);
+ 	clk_cpu_8994_pll1_init_hw(&a57_pll1);
+ 

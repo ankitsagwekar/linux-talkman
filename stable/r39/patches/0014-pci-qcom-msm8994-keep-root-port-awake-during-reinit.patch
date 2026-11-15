@@ -1,0 +1,35 @@
+From: Claude <noreply@anthropic.com>
+Subject: [PATCH] PCI: qcom: msm8994: keep the root port awake while the RC is reinitialised
+
+The second bring-up pass tears the root complex down (clocks and PHY off)
+while the root port is still registered. If the PM core runtime-suspends the
+root port in that window, pci_pm_runtime_suspend() -> pci_save_state() reads
+its config space, which on an unclocked DWC core is a synchronous external
+abort: the kworker dies with irqs disabled and the phone freezes.
+
+Forbid runtime PM on the root port before the teardown.
+
+---
+ drivers/pci/controller/dwc/pcie-qcom.c | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+--- a/drivers/pci/controller/dwc/pcie-qcom.c
++++ b/drivers/pci/controller/dwc/pcie-qcom.c
+@@ -1006,6 +1006,17 @@ static void qcom_pcie_host_post_msm8994(struct qcom_pcie *pcie)
+ 	if (!dw_pcie_link_up(pci)) {
+ 		dev_info(pci->dev, "first pass trained no link, redoing it powered\n");
+ 
++		{
++			/* runtime suspend would read config space with the RC off */
++			struct pci_dev *rp = pci_get_slot(pp->bridge->bus,
++							  PCI_DEVFN(0, 0));
++
++			if (rp) {
++				pm_runtime_forbid(&rp->dev);
++				pci_dev_put(rp);
++			}
++		}
++
+ 		QTRACE(pci->dev, "P1 host_deinit start");
+ 		qcom_pcie_host_deinit(pp);
+ 		QTRACE(pci->dev, "P2 host_deinit done");

@@ -1,0 +1,168 @@
+From: Claude <noreply@anthropic.com>
+Subject: [PATCH] arm64: dts: qcom: lumia-talkman: CPU frequency scaling
+
+Wire the apcc CPU clock controller (clk-cpu-8994, EpicLPer) to the six CPUs,
+the VDD_APC SPMI rails and cpufreq-dt OPP tables for the 8992 speedbin0:
+A53 600-960 MHz, A57 384-768 MHz. The A57 is capped at 768 MHz because the
+Lumia secure firmware cannot program the A57 ACC (see clk-cpu-8994): at
+960 MHz and above it hangs under sustained load. Kept in the board file: the other 8992 boards
+are untested with this.
+
+---
+--- a/arch/arm64/boot/dts/qcom/msm8992-msft-lumia-octagon-talkman.dts
++++ b/arch/arm64/boot/dts/qcom/msm8992-msft-lumia-octagon-talkman.dts
+@@ -6,6 +6,8 @@
+ 
+ /dts-v1/;
+ 
++#include <dt-bindings/clock/qcom,msm8994-cpu.h>
++
+ #include "msm8992.dtsi"
+ #include "msm8994-msft-lumia-octagon.dtsi"
+ 
+@@ -63,3 +65,145 @@
+ 		reset-gpios = <&tlmm 35 GPIO_ACTIVE_LOW>;
+ 	};
+ };
++
++/*
++ * CPU frequency scaling (3.10 clock-cpu-8994 + speedbin0 tables). The A53
++ * cluster tops out at 960 MHz here. The A57 cluster is capped at 768 MHz:
++ * the secure firmware cannot set the A57 ACC that higher rates need, and
++ * 960 MHz+ hangs under sustained load (the hardware goes to 1.69 GHz).
++ */
++&cpu0 {
++	clocks = <&apcc APCS_CPU_A53_CLK>;
++	cpu-supply = <&pm8994_s8>;
++	operating-points-v2 = <&cluster0_opp>;
++	#cooling-cells = <2>;
++};
++
++&cpu1 {
++	clocks = <&apcc APCS_CPU_A53_CLK>;
++	cpu-supply = <&pm8994_s8>;
++	operating-points-v2 = <&cluster0_opp>;
++	#cooling-cells = <2>;
++};
++
++&cpu2 {
++	clocks = <&apcc APCS_CPU_A53_CLK>;
++	cpu-supply = <&pm8994_s8>;
++	operating-points-v2 = <&cluster0_opp>;
++	#cooling-cells = <2>;
++};
++
++&cpu3 {
++	clocks = <&apcc APCS_CPU_A53_CLK>;
++	cpu-supply = <&pm8994_s8>;
++	operating-points-v2 = <&cluster0_opp>;
++	#cooling-cells = <2>;
++};
++
++&cpu4 {
++	clocks = <&apcc APCS_CPU_A57_CLK>;
++	cpu-supply = <&pm8994_s11>;
++	operating-points-v2 = <&cluster1_opp>;
++	#cooling-cells = <2>;
++};
++
++&cpu5 {
++	clocks = <&apcc APCS_CPU_A57_CLK>;
++	cpu-supply = <&pm8994_s11>;
++	operating-points-v2 = <&cluster1_opp>;
++	#cooling-cells = <2>;
++};
++
++&pm8994_spmi_regulators {
++	/* VDD_APC rails: never switch them off, cpufreq-dt retunes them */
++	pm8994_s8: s8 {
++		regulator-min-microvolt = <700000>;
++		regulator-max-microvolt = <1180000>;
++		regulator-always-on;
++		regulator-boot-on;
++	};
++
++	pm8994_s11: s11 {
++		regulator-min-microvolt = <700000>;
++		regulator-max-microvolt = <1225000>;
++		regulator-always-on;
++		regulator-boot-on;
++	};
++};
++
++&soc {
++	apcc: clock-controller@f9015000 {
++		compatible = "qcom,msm8992-cpu-clk", "qcom,msm8994-cpu-clk";
++		reg = <0xf9015000 0x80>,
++		      <0xf9016000 0x80>,
++		      <0xf900f000 0x1000>;
++		reg-names = "c0-pll", "c1-pll", "c1-mux";
++		qcom,apcs = <&apcs>;
++		power-domains = <&rpmpd MSM8994_VDDMX_AO>;
++		clocks = <&xo_board>, <&gcc GPLL0>;
++		clock-names = "xo", "aux";
++		#clock-cells = <1>;
++	};
++};
++
++/ {
++	cluster0_opp: opp-table-cluster0 {
++		compatible = "operating-points-v2";
++		opp-shared;
++
++		opp-600000000 {
++			opp-hz = /bits/ 64 <600000000>;
++			opp-microvolt = <900000>;
++		};
++
++		opp-672000000 {
++			opp-hz = /bits/ 64 <672000000>;
++			opp-microvolt = <1000000>;
++		};
++
++		opp-787200000 {
++			opp-hz = /bits/ 64 <787200000>;
++			opp-microvolt = <1000000>;
++		};
++
++		opp-864000000 {
++			opp-hz = /bits/ 64 <864000000>;
++			opp-microvolt = <1115000>;
++		};
++
++		opp-960000000 {
++			opp-hz = /bits/ 64 <960000000>;
++			opp-microvolt = <1115000>;
++		};
++	};
++
++	cluster1_opp: opp-table-cluster1 {
++		compatible = "operating-points-v2";
++		opp-shared;
++
++		opp-384000000 {
++			opp-hz = /bits/ 64 <384000000>;
++			opp-microvolt = <900000>;
++		};
++
++		opp-480000000 {
++			opp-hz = /bits/ 64 <480000000>;
++			opp-microvolt = <900000>;
++		};
++
++		opp-600000000 {
++			opp-hz = /bits/ 64 <600000000>;
++			opp-microvolt = <900000>;
++		};
++
++		opp-633600000 {
++			opp-hz = /bits/ 64 <633600000>;
++			opp-microvolt = <900000>;
++		};
++
++		opp-768000000 {
++			opp-hz = /bits/ 64 <768000000>;
++			opp-microvolt = <1000000>;
++		};
++	};
++};

@@ -1,0 +1,233 @@
+From: Ankit <ankits@outlook.sg>
+Subject: [PATCH] arm64: dts: qcom: msm8994-lumia-octagon: enable USB-C OTG
+
+Describe the PMI8994 SMBCHG charger (disabled by default), switch the
+UC120 node to the lattice,uc120 driver, put DWC3 in OTG mode with a USB
+role switch linked to the USB-C connector, and enable the charger with a
+battery description plus VBUS supply on the Lumia 950 (talkman).
+
+Based on Android4Lumia950/linux commit eb871dc826.
+---
+diff --git a/arch/arm64/boot/dts/qcom/msm8992-msft-lumia-octagon-talkman.dts b/arch/arm64/boot/dts/qcom/msm8992-msft-lumia-octagon-talkman.dts
+index 8933b5369..db3c4d4b1 100644
+--- a/arch/arm64/boot/dts/qcom/msm8992-msft-lumia-octagon-talkman.dts
++++ b/arch/arm64/boot/dts/qcom/msm8992-msft-lumia-octagon-talkman.dts
+@@ -13,4 +13,25 @@ / {
+ 	model = "Microsoft Lumia 950";
+ 	compatible = "microsoft,talkman", "qcom,msm8992";
+ 	chassis-type = "handset";
++
++	battery: battery {
++		compatible = "simple-battery";
++		device-chemistry = "lithium-ion-polymer";
++		charge-full-design-microamp-hours = <3000000>;
++		voltage-min-design-microvolt = <2800000>;
++		voltage-max-design-microvolt = <4400000>;
++		/* Downstream: float 4.35 V, iterm 100 mA. Fast charge kept conservative. */
++		constant-charge-voltage-max-microvolt = <4350000>;
++		constant-charge-current-max-microamp = <1500000>;
++		charge-term-current-microamp = <100000>;
++	};
++};
++
++&pmi8994_smbchg {
++	monitored-battery = <&battery>;
++	status = "okay";
++};
++
++&uc120 {
++	vbus-supply = <&pmi8994_otg>;
+ };
+diff --git a/arch/arm64/boot/dts/qcom/msm8994-msft-lumia-octagon.dtsi b/arch/arm64/boot/dts/qcom/msm8994-msft-lumia-octagon.dtsi
+index 4c983b10d..37b41ea31 100644
+--- a/arch/arm64/boot/dts/qcom/msm8994-msft-lumia-octagon.dtsi
++++ b/arch/arm64/boot/dts/qcom/msm8994-msft-lumia-octagon.dtsi
+@@ -440,15 +440,32 @@ &blsp2_spi4 {
+ 	 * the device firmware with a specific bitstream
+ 	 * enabling USB Type C PHY functionality.
+ 	 * Communication is done via a proprietary protocol over SPI.
+-	 *
+-	 * TODO: Once a proper driver is available, replace this.
+ 	 */
+ 	uc120: ice5lp2k@0 {
+-		compatible = "lattice,ice40-fpga-mgr";
++		compatible = "lattice,uc120";
+ 		reg = <0>;
+ 		spi-max-frequency = <5000000>;
+-		cdone-gpios = <&tlmm 95 GPIO_ACTIVE_HIGH>;
+-		reset-gpios = <&pmi8994_gpios 4 GPIO_ACTIVE_LOW>;
++		interrupt-parent = <&tlmm>;
++		interrupts = <95 IRQ_TYPE_EDGE_FALLING>;
++		pinctrl-names = "default";
++		pinctrl-0 = <&uc120_int_default>;
++		usb-psy-name = "qcom-smbchg-usb";
++		orientation-gpios = <&pmi8994_gpios 8 GPIO_ACTIVE_HIGH>;
++
++		connector {
++			compatible = "usb-c-connector";
++			label = "USB-C";
++			power-role = "dual";
++			try-power-role = "sink";
++			data-role = "dual";
++			typec-power-opmode = "default";
++
++			port {
++				uc120_hs_out: endpoint {
++					remote-endpoint = <&usb3_role_switch_in>;
++				};
++			};
++		};
+ 	};
+ };
+ 
+@@ -502,23 +519,13 @@ resin {
+ };
+ 
+ &pmi8994_gpios {
+-	pinctrl-0 = <&hd3ss460_pol &hd3ss460_amsel &hd3ss460_en>;
++	pinctrl-0 = <&hd3ss460_amsel &hd3ss460_en>;
+ 	pinctrl-names = "default";
+ 
+ 	/*
+-	 * This device uses a TI HD3SS460 Type-C MUX
+-	 * As this device has no driver currently,
+-	 * the configuration for USB Face Up is set-up here.
+-	 *
+-	 * TODO: remove once a driver is available
+-	 * TODO: add VBUS GPIO 5
++	 * This device uses a TI HD3SS460 Type-C MUX.
++	 * Its polarity input (GPIO 8) is driven by the UC120 driver.
+ 	 */
+-	hd3ss460_pol: pol-low-state {
+-		pins = "gpio8";
+-		function = PMIC_GPIO_FUNC_NORMAL;
+-		qcom,drive-strength = <3>;
+-		bias-pull-down;
+-	};
+ 
+ 	hd3ss460_amsel: amsel-high-state {
+ 		pins = "gpio9";
+@@ -873,7 +880,27 @@ &sdhc2 {
+ 	cd-gpios = <&pm8994_gpios 8 GPIO_ACTIVE_LOW>;
+ };
+ 
++&usb3_dwc3 {
++	dr_mode = "otg";
++	usb-role-switch;
++	role-switch-default-mode = "peripheral";
++
++	port {
++		usb3_role_switch_in: endpoint {
++			remote-endpoint = <&uc120_hs_out>;
++		};
++	};
++};
++
+ &tlmm {
++	uc120_int_default: uc120-int-default-state {
++		pins = "gpio95";
++		function = "gpio";
++		drive-strength = <2>;
++		bias-pull-up;
++		input-enable;
++	};
++
+ 	grip_default: grip-default-state {
+ 		pins = "gpio39";
+ 		function = "gpio";
+diff --git a/arch/arm64/boot/dts/qcom/msm8994.dtsi b/arch/arm64/boot/dts/qcom/msm8994.dtsi
+index b5cbdd620..b509c0103 100644
+--- a/arch/arm64/boot/dts/qcom/msm8994.dtsi
++++ b/arch/arm64/boot/dts/qcom/msm8994.dtsi
+@@ -462,7 +462,7 @@ usb3: usb@f92f8800 {
+ 			power-domains = <&gcc USB30_GDSC>;
+ 			qcom,select-utmi-as-pipe-clk;
+ 
+-			usb@f9200000 {
++			usb3_dwc3: usb@f9200000 {
+ 				compatible = "snps,dwc3";
+ 				reg = <0xf9200000 0xcc00>;
+ 				interrupts = <GIC_SPI 131 IRQ_TYPE_LEVEL_HIGH>;
+diff --git a/arch/arm64/boot/dts/qcom/pmi8994.dtsi b/arch/arm64/boot/dts/qcom/pmi8994.dtsi
+index 9ee59e6d2..b9f8bcdb9 100644
+--- a/arch/arm64/boot/dts/qcom/pmi8994.dtsi
++++ b/arch/arm64/boot/dts/qcom/pmi8994.dtsi
+@@ -20,6 +20,78 @@ pmi8994_gpios: gpio@c000 {
+ 			#interrupt-cells = <2>;
+ 		};
+ 
++		pmi8994_smbchg: charger@1000 {
++			compatible = "qcom,pmi8994-smbchg";
++			reg = <0x1000>;
++
++			interrupts = <0x2 0x10 0x0 IRQ_TYPE_EDGE_BOTH>,
++				     <0x2 0x10 0x1 IRQ_TYPE_EDGE_BOTH>,
++				     <0x2 0x10 0x2 IRQ_TYPE_EDGE_BOTH>,
++				     <0x2 0x10 0x3 IRQ_TYPE_EDGE_BOTH>,
++				     <0x2 0x10 0x4 IRQ_TYPE_EDGE_BOTH>,
++				     <0x2 0x10 0x5 IRQ_TYPE_EDGE_BOTH>,
++				     <0x2 0x10 0x6 IRQ_TYPE_EDGE_RISING>,
++				     <0x2 0x10 0x7 IRQ_TYPE_EDGE_RISING>,
++				     <0x2 0x12 0x0 IRQ_TYPE_EDGE_BOTH>,
++				     <0x2 0x12 0x1 IRQ_TYPE_EDGE_BOTH>,
++				     <0x2 0x12 0x2 IRQ_TYPE_EDGE_BOTH>,
++				     <0x2 0x12 0x3 IRQ_TYPE_EDGE_BOTH>,
++				     <0x2 0x12 0x4 IRQ_TYPE_EDGE_BOTH>,
++				     <0x2 0x12 0x5 IRQ_TYPE_EDGE_BOTH>,
++				     <0x2 0x12 0x6 IRQ_TYPE_EDGE_BOTH>,
++				     <0x2 0x12 0x7 IRQ_TYPE_EDGE_BOTH>,
++				     <0x2 0x13 0x0 IRQ_TYPE_EDGE_BOTH>,
++				     <0x2 0x13 0x1 IRQ_TYPE_EDGE_BOTH>,
++				     <0x2 0x13 0x2 IRQ_TYPE_EDGE_BOTH>,
++				     <0x2 0x13 0x3 IRQ_TYPE_EDGE_BOTH>,
++				     <0x2 0x13 0x4 IRQ_TYPE_EDGE_RISING>,
++				     <0x2 0x13 0x5 IRQ_TYPE_EDGE_RISING>,
++				     <0x2 0x13 0x6 IRQ_TYPE_EDGE_FALLING>,
++				     <0x2 0x14 0x0 IRQ_TYPE_EDGE_BOTH>,
++				     <0x2 0x14 0x1 IRQ_TYPE_EDGE_BOTH>,
++				     <0x2 0x16 0x0 IRQ_TYPE_EDGE_BOTH>,
++				     <0x2 0x16 0x1 IRQ_TYPE_EDGE_BOTH>,
++				     <0x2 0x16 0x2 IRQ_TYPE_EDGE_BOTH>,
++				     <0x2 0x16 0x3 IRQ_TYPE_EDGE_BOTH>,
++				     <0x2 0x16 0x4 IRQ_TYPE_EDGE_BOTH>,
++				     <0x2 0x16 0x5 IRQ_TYPE_EDGE_BOTH>;
++			interrupt-names = "chg-error",
++					  "chg-inhibit",
++					  "chg-prechg-sft",
++					  "chg-complete-chg-sft",
++					  "chg-p2f-thr",
++					  "chg-rechg-thr",
++					  "chg-taper-thr",
++					  "chg-tcc-thr",
++					  "batt-hot",
++					  "batt-warm",
++					  "batt-cold",
++					  "batt-cool",
++					  "batt-ov",
++					  "batt-low",
++					  "batt-missing",
++					  "batt-term-missing",
++					  "usbin-uv",
++					  "usbin-ov",
++					  "usbin-src-det",
++					  "otg-fail",
++					  "otg-oc",
++					  "aicl-done",
++					  "usbid-change",
++					  "dcin-uv",
++					  "dcin-ov",
++					  "power-ok",
++					  "temp-shutdown",
++					  "wdog-timeout",
++					  "flash-fail",
++					  "otst2",
++					  "otst3";
++
++			status = "disabled";
++
++			pmi8994_otg: otg-vbus {};
++		};
++
+ 		pmi8994_mpps: mpps@a000 {
+ 			compatible = "qcom,pmi8994-mpp", "qcom,spmi-mpp";
+ 			reg = <0xa000>;

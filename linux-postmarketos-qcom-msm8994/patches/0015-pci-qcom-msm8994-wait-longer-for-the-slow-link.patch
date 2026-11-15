@@ -1,0 +1,30 @@
+From: Claude <noreply@anthropic.com>
+Subject: [PATCH] PCI: qcom: msm8994: wait up to 10 s for the QCA6174 link
+
+dw_pcie_wait_for_link() gives up after about 1 s, but the QCA6174 on this
+platform trains a bit later than that (a manual rescan seconds afterwards
+finds it). Keep polling before declaring the endpoint missing.
+
+---
+ drivers/pci/controller/dwc/pcie-qcom.c | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+--- a/drivers/pci/controller/dwc/pcie-qcom.c
++++ b/drivers/pci/controller/dwc/pcie-qcom.c
+@@ -1052,6 +1052,16 @@ static void qcom_pcie_host_post_msm8994(struct qcom_pcie *pcie)
+ 
+ 		QTRACE(pci->dev, "P9 wait_for_link");
+ 		ret = dw_pcie_wait_for_link(pci);
++		if (ret) {
++			/* the QCA6174 trains slowly: keep polling for up to 10 s */
++			int tries;
++
++			for (tries = 0; tries < 100 && !dw_pcie_link_up(pci); tries++)
++				msleep(100);
++			if (dw_pcie_link_up(pci))
++				ret = 0;
++			QTRACE(pci->dev, "P9b link %s after %d ms extra", ret ? "down" : "up", tries * 100);
++		}
+ 		QTRACE(pci->dev, "P10 wait_for_link done ret=%d", ret);
+ 		if (ret) {
+ 			dev_err(pci->dev, "endpoint did not answer (%d)\n", ret);

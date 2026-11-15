@@ -1,0 +1,12 @@
+[Unit]
+Description=RPM channel watch (debug): ping the RPM every 2 s after boot
+DefaultDependencies=no
+After=local-fs.target
+Before=talkman-wifi.service sysinit.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'insmod /usr/local/lib/talkman-cpufreq/rpm-watch.ko rpm_watch_secs=150'
+
+[Install]
+WantedBy=sysinit.target

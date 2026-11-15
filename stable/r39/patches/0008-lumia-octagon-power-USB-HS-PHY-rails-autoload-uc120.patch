@@ -1,0 +1,55 @@
+From: Ankit <ankits@outlook.sg>
+Subject: [PATCH] lumia-octagon: power the USB HS PHY rails, autoload uc120
+
+- Keep PM8994 L6 (vdda18) and L24 (vdda33) on: they feed the USB HS PHY
+  and downstream forces them on. Without a HS PHY driver nothing votes
+  for them, and the UDC stays "not attached" with an SDP port present.
+- Add an spi_device_id table to uc120: SPI devices uevent as
+  spi:<name>, so the module was never autoloaded.
+---
+diff --git a/arch/arm64/boot/dts/qcom/msm8994-msft-lumia-octagon.dtsi b/arch/arm64/boot/dts/qcom/msm8994-msft-lumia-octagon.dtsi
+index cf613e9..3060896 100644
+--- a/arch/arm64/boot/dts/qcom/msm8994-msft-lumia-octagon.dtsi
++++ b/arch/arm64/boot/dts/qcom/msm8994-msft-lumia-octagon.dtsi
+@@ -663,6 +663,9 @@ vreg_l6a_1p8: l6 {
+ 			regulator-max-microvolt = <1800000>;
+ 			regulator-allow-set-load;
+ 			regulator-system-load = <1000>;
++			/* USB HS PHY vdda18; downstream forces it on (vdda-force-on) */
++			regulator-always-on;
++			regulator-boot-on;
+ 		};
+ 
+ 		/* L7 is inaccessible from RPM */
+@@ -786,6 +789,9 @@ vreg_l24a_3p075: l24 {
+ 			regulator-max-microvolt = <3150000>;
+ 			regulator-allow-set-load;
+ 			regulator-system-load = <5800>;
++			/* USB HS PHY vdda33; downstream forces it on (vdda-force-on) */
++			regulator-always-on;
++			regulator-boot-on;
+ 		};
+ 
+ 		vreg_l25a_1p1: l25 {
+diff --git a/drivers/usb/typec/uc120.c b/drivers/usb/typec/uc120.c
+index 81b470f..2265cac 100644
+--- a/drivers/usb/typec/uc120.c
++++ b/drivers/usb/typec/uc120.c
+@@ -937,9 +937,17 @@ static const struct of_device_id uc120_of_match[] = {
+ };
+ MODULE_DEVICE_TABLE(of, uc120_of_match);
+ 
++/* SPI devices uevent as spi:<name>; needed for module autoloading */
++static const struct spi_device_id uc120_spi_ids[] = {
++	{ "uc120" },
++	{ }
++};
++MODULE_DEVICE_TABLE(spi, uc120_spi_ids);
++
+ static struct spi_driver uc120_driver = {
+ 	.probe = uc120_probe,
+ 	.remove = uc120_remove,
++	.id_table = uc120_spi_ids,
+ 	.driver = {
+ 		.name = "uc120",
+ 		.of_match_table = uc120_of_match,

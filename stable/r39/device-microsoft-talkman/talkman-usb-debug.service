@@ -1,0 +1,12 @@
+[Unit]
+Description=Dump USB/USB-C debug state for Lumia 950 bring-up
+
+[Service]
+Type=oneshot
+ExecStartPre=/bin/sleep 20
+ExecStart=/usr/libexec/talkman-usb-debug.sh
+ExecStart=/bin/sleep 40
+ExecStart=/usr/libexec/talkman-usb-debug.sh
+
+[Install]
+WantedBy=multi-user.target

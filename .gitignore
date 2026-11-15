@@ -1,0 +1,20 @@
+# Built packages and images (rebuild with pmbootstrap; large)
+ota/
+*.apk
+*.img
+update/vmlinuz
+update/initramfs
+update/*.dtb
+stable/*/image/
+next/*.tar.gz
+
+# Proprietary Qualcomm firmware copied from the phone (tools/get-venus-fw.sh)
+firmware/
+
+# Logs, scratch modules and binaries
+logs*/
+modules/
+tools/regpoke
+windows/*.efi
+*.ko
+*.o

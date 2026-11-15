@@ -1,0 +1,51 @@
+From c7cee04715fd2da9c0cbff06a00ddb9789df5c59 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Tue, 6 Oct 2026 11:29:50 +0000
+Subject: [PATCH] power: supply: qcom-pmi8994-fg: export signed battery current
+
+current_now was the absolute value, so discharge and charge looked the
+same. The SRAM sample is a signed 16-bit QPNP FG_DATA_CURRENT value and
+PMI8994 sets PATCH_NEG_CURRENT_BIT. Export that sign. Negative is
+discharge, per sysfs-class-power.
+
+The 152.587 uA LSB is unchanged. It is the QPNP conversion for this
+register, and the termination-current encoder uses the same weight.
+
+Co-authored-by: EpicLPer <epiclper7@gmail.com>
+---
+ drivers/power/supply/qcom-pmi8994-fg.c | 15 ++++++++++++---
+ 1 file changed, 12 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/power/supply/qcom-pmi8994-fg.c b/drivers/power/supply/qcom-pmi8994-fg.c
+index 4e2b6d2383aa5f..8da541a9f660e4 100644
+--- a/drivers/power/supply/qcom-pmi8994-fg.c
++++ b/drivers/power/supply/qcom-pmi8994-fg.c
+@@ -420,6 +420,12 @@ static int fg_voltage_uv(struct pmi8994_fg *fg, int *uv)
+ 	return 0;
+ }
+ 
++/*
++ * QPNP FG_DATA_CURRENT. The sample is the s16 at VOLTAGE_ADDR offset 3
++ * (0x5cc, 3). LSB_16B is 152.587 uA, the same weight as voltage, and the
++ * value is already signed. PMI8994 sets PATCH_NEG_CURRENT_BIT so discharge
++ * stays negative.
++ */
+ static int fg_current_ua(struct pmi8994_fg *fg, int *ua)
+ {
+ 	u16 raw;
+@@ -751,9 +757,12 @@ static int fg_get_property(struct power_supply *psy,
+ 		rc = fg_refresh_telem(fg);
+ 		if (rc)
+ 			return rc;
+-		/* Magnitude: UPower 1.91 treats current_now < 0 as discharge. */
+-		val->intval = fg->current_ua < 0 ? -fg->current_ua
+-						 : fg->current_ua;
++		/*
++		 * Signed uA, negative for discharge. The SRAM value is an
++		 * s16 and PMI8994 sets PATCH_NEG_CURRENT_BIT so that sign
++		 * is the one the block reports.
++		 */
++		val->intval = fg->current_ua;
+ 		return 0;
+ 	case POWER_SUPPLY_PROP_TEMP:
+ 		rc = fg_refresh_telem(fg);

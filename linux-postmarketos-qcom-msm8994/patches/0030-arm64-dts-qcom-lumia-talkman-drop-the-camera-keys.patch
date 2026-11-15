@@ -1,0 +1,24 @@
+From: Claude <noreply@anthropic.com>
+Subject: [PATCH] arm64: dts: qcom: lumia-talkman: drop the camera keys
+
+The camera focus key (PM8994 GPIO 5) has no pull-up and reads as held from
+boot; gpio-keys then auto-repeats it forever, which keeps resetting the
+console blank timer. Remove both camera keys; volume up stays.
+
+---
+--- a/arch/arm64/boot/dts/qcom/msm8992-msft-lumia-octagon-talkman.dts	2026-11-15 10:15:42.014431396 +0530
++++ b/arch/arm64/boot/dts/qcom/msm8992-msft-lumia-octagon-talkman.dts	2026-11-15 10:15:42.040624199 +0530
+@@ -487,3 +487,13 @@
+ 		max-reason = <3>;
+ 	};
+ };
++
++/*
++ * No camera keys: the focus key's PMIC GPIO 5 has no pull-up and reads as
++ * held from boot, which auto-repeats forever and keeps the console from ever
++ * blanking. Volume up stays.
++ */
++&{/gpio-keys} {
++	/delete-node/ camsnap-key;
++	/delete-node/ camfocus-key;
++};

@@ -1,0 +1,44 @@
+From: Ankit <ankits@outlook.sg>
+Subject: [PATCH] arm64: dts: qcom: lumia-octagon: fix BLSP DMA so SPI/I2C probe
+
+The BLSP BAMs are controlled by TZ. With bam_clk in DT the QUPs that use
+them defer forever ("tx channel not available"), so the UC120 USB-C PHY on
+blsp2_spi4 never probes. Drop the BAM clocks on Octagon (as in
+Android4Lumia950/linux bff0b2666f) and run blsp2_spi4 in PIO mode.
+---
+diff --git a/arch/arm64/boot/dts/qcom/msm8994-msft-lumia-octagon.dtsi b/arch/arm64/boot/dts/qcom/msm8994-msft-lumia-octagon.dtsi
+index 890baf5..84699a2 100644
+--- a/arch/arm64/boot/dts/qcom/msm8994-msft-lumia-octagon.dtsi
++++ b/arch/arm64/boot/dts/qcom/msm8994-msft-lumia-octagon.dtsi
+@@ -431,9 +431,31 @@ vreg_lpddr_1p1: fan53526a@6c {
+ 	/* ANX7816 HDMI bridge (needs MDSS HDMI) */
+ };
+ 
++/*
++ * The BLSP BAMs are owned by TZ (qcom,controlled-remotely). Voting for their
++ * AHB clock from Linux breaks them, and every QUP using DMA then defers
++ * forever ("tx channel not available"). Android4Lumia950/linux bff0b2666f.
++ */
++&blsp1_dma {
++	/delete-property/ clocks;
++	/delete-property/ clock-names;
++};
++
++&blsp2_dma {
++	/delete-property/ clocks;
++	/delete-property/ clock-names;
++};
++
+ &blsp2_spi4 {
+ 	status = "okay";
+ 
++	/*
++	 * The UC120 only needs a few bytes per transfer. Use PIO so the
++	 * USB-C PHY does not depend on the BLSP2 BAM DMA coming up.
++	 */
++	/delete-property/ dmas;
++	/delete-property/ dma-names;
++
+ 	/*
+ 	 * This device is a Lattice UC120 USB-C PD PHY.
+ 	 * It is actually a Lattice iCE40 FPGA pre-programmed by

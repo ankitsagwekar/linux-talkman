@@ -1,0 +1,82 @@
+From: Claude <noreply@anthropic.com>
+Subject: [PATCH] drm/sysfb: show black while the CRTC is off
+
+simpledrm cannot power the panel down, so console blanking (DPMS off) left
+the last picture on screen. Clear the framebuffer to black in a new CRTC
+atomic_disable hook and skip plane updates while the CRTC is inactive; the
+modeset that turns it back on redraws the full picture.
+
+---
+--- a/drivers/gpu/drm/sysfb/drm_sysfb_helper.h	2025-07-28 02:56:38.000000000 +0530
++++ b/drivers/gpu/drm/sysfb/drm_sysfb_helper.h	2026-11-15 05:32:16.891992057 +0530
+@@ -141,10 +141,12 @@
+ enum drm_mode_status drm_sysfb_crtc_helper_mode_valid(struct drm_crtc *crtc,
+ 						      const struct drm_display_mode *mode);
+ int drm_sysfb_crtc_helper_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state *new_state);
++void drm_sysfb_crtc_helper_atomic_disable(struct drm_crtc *crtc, struct drm_atomic_state *state);
+ 
+ #define DRM_SYSFB_CRTC_HELPER_FUNCS \
+ 	.mode_valid = drm_sysfb_crtc_helper_mode_valid, \
+-	.atomic_check = drm_sysfb_crtc_helper_atomic_check
++	.atomic_check = drm_sysfb_crtc_helper_atomic_check, \
++	.atomic_disable = drm_sysfb_crtc_helper_atomic_disable
+ 
+ void drm_sysfb_crtc_reset(struct drm_crtc *crtc);
+ struct drm_crtc_state *drm_sysfb_crtc_atomic_duplicate_state(struct drm_crtc *crtc);
+--- a/drivers/gpu/drm/sysfb/drm_sysfb_modeset.c	2025-07-28 02:56:38.000000000 +0530
++++ b/drivers/gpu/drm/sysfb/drm_sysfb_modeset.c	2026-11-15 05:32:16.892066179 +0530
+@@ -102,9 +102,24 @@
+ 	unsigned int dst_pitch = sysfb->fb_pitch;
+ 	const struct drm_format_info *dst_format = sysfb->fb_format;
+ 	struct drm_atomic_helper_damage_iter iter;
++	struct drm_crtc *crtc = plane_state->crtc;
+ 	struct drm_rect damage;
+ 	int ret, idx;
+ 
++	/*
++	 * Do not draw while the CRTC is off (DPMS / console blank): the CRTC
++	 * disable hook left the framebuffer black. Commits that only carry
++	 * damage do not include the CRTC, so fall back to its current state.
++	 */
++	if (crtc) {
++		struct drm_crtc_state *crtc_state = drm_atomic_get_new_crtc_state(state, crtc);
++
++		if (!crtc_state)
++			crtc_state = crtc->state;
++		if (crtc_state && !crtc_state->active)
++			return;
++	}
++
+ 	ret = drm_gem_fb_begin_cpu_access(fb, DMA_FROM_DEVICE);
+ 	if (ret)
+ 		return;
+@@ -230,6 +245,29 @@
+ }
+ EXPORT_SYMBOL(drm_sysfb_crtc_helper_atomic_check);
+ 
++/*
++ * A firmware framebuffer cannot power the panel down. When the CRTC is
++ * switched off (DPMS off, console blanking) fill the framebuffer with black;
++ * on an AMOLED panel black pixels are off. Switching it back on is a full
++ * modeset, so the plane update in that commit redraws the whole picture.
++ */
++void drm_sysfb_crtc_helper_atomic_disable(struct drm_crtc *crtc, struct drm_atomic_state *state)
++{
++	struct drm_device *dev = crtc->dev;
++	struct drm_sysfb_device *sysfb = to_drm_sysfb_device(dev);
++	size_t len = (size_t)sysfb->fb_mode.vdisplay * sysfb->fb_pitch;
++	int idx;
++
++	if (!drm_dev_enter(dev, &idx))
++		return;
++	if (sysfb->fb_addr.is_iomem)
++		memset_io(sysfb->fb_addr.vaddr_iomem, 0, len);
++	else
++		memset(sysfb->fb_addr.vaddr, 0, len);
++	drm_dev_exit(idx);
++}
++EXPORT_SYMBOL(drm_sysfb_crtc_helper_atomic_disable);
++
+ void drm_sysfb_crtc_reset(struct drm_crtc *crtc)
+ {
+ 	struct drm_sysfb_crtc_state *sysfb_crtc_state;

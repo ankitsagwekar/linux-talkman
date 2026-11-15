@@ -1,0 +1,25 @@
+From: Claude <noreply@anthropic.com>
+Subject: [PATCH] clk: qcom: clk-cpu-8994: add recalc_rate to the mux ops
+
+The 6.16 clk core rejects clocks that have .set_rate but no .recalc_rate
+("failed to register clk a53_lf_mux", -EINVAL). A mux runs at its parent rate.
+
+---
+--- a/drivers/clk/qcom/clk-cpu-8994.c
++++ b/drivers/clk/qcom/clk-cpu-8994.c
+@@ -585,7 +585,15 @@
+ 	return 0;
+ }
+ 
++/* 6.16's clk core insists on .recalc_rate next to .set_rate; a mux runs at its parent's rate */
++static unsigned long clk_cpu_8994_mux_recalc_rate(struct clk_hw *hw,
++						  unsigned long parent_rate)
++{
++	return parent_rate;
++}
++
+ static const struct clk_ops clk_cpu_8994_mux_ops = {
++	.recalc_rate = clk_cpu_8994_mux_recalc_rate,
+ 	.get_parent = clk_cpu_8994_mux_get_parent,
+ 	.set_parent = clk_cpu_8994_mux_set_parent,
+ 	.set_rate = clk_cpu_8994_mux_set_rate,

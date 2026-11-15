@@ -1,0 +1,29 @@
+From: Claude <noreply@anthropic.com>
+Subject: [PATCH] arm64: dts: qcom: lumia-octagon: keep VDD_GFX on
+
+PMI8994 S2 (VDD_GFX) is also managed by the RPM. With no GPU consumer the
+regulator core disables it 30 s after boot, which leaves the RPM unresponsive
+(every RPM request times out) and the phone resets minutes later.
+
+---
+--- a/arch/arm64/boot/dts/qcom/msm8994-msft-lumia-octagon.dtsi	2026-11-14 17:51:13.838844140 +0530
++++ b/arch/arm64/boot/dts/qcom/msm8994-msft-lumia-octagon.dtsi	2026-11-14 17:51:16.200798186 +0530
+@@ -536,9 +536,18 @@
+ };
+ 
+ &pmi8994_spmi_regulators {
++	/*
++	 * PMI8994 S2 is VDD_GFX, which the RPM also owns (rpmpd gfx_s2b).
++	 * Nothing consumes it until the GPU is supported, so the regulator
++	 * core's "disable unused" pass would switch it off ~30 s after boot,
++	 * behind the RPM's back: the RPM then stops answering every request
++	 * (all RPM-managed clocks, rails and power domains) and the phone
++	 * later resets. Keep it on.
++	 */
+ 	vdd_gfx: s2 {
+ 		regulator-min-microvolt = <980000>;
+ 		regulator-max-microvolt = <980000>;
++		regulator-always-on;
+ 	};
+ };
+ 

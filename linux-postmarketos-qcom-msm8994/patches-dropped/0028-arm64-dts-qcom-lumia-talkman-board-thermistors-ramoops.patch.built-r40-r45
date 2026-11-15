@@ -1,0 +1,208 @@
+From: Claude <noreply@anthropic.com>
+Subject: [PATCH] arm64: dts: qcom: lumia-talkman: board thermistors, CPU throttling, ramoops
+
+Board thermistors on the PM8994 VADC with critical trips (EpicLPer
+59975118), a 65 C passive trip on msm-therm that throttles both CPU clusters
+through cpufreq, and a ramoops region so the kernel log survives a freeze.
+
+---
+--- a/arch/arm64/boot/dts/qcom/msm8992-msft-lumia-octagon-talkman.dts	2026-11-15 04:55:53.219577681 +0530
++++ b/arch/arm64/boot/dts/qcom/msm8992-msft-lumia-octagon-talkman.dts	2026-11-15 04:56:27.516939063 +0530
+@@ -7,6 +7,7 @@
+ /dts-v1/;
+ 
+ #include <dt-bindings/clock/qcom,msm8994-cpu.h>
++#include <dt-bindings/thermal/thermal.h>
+ 
+ #include "msm8992.dtsi"
+ #include "msm8994-msft-lumia-octagon.dtsi"
+@@ -300,3 +301,189 @@
+ &cpu5 {
+ 	cpu-idle-states = <&big_cpu_sleep_0>;
+ };
++
++/*
++ * Board thermistors on the PM8994 VADC (EpicLPer 59975118, from the 3.10
++ * mmo/common/adc.dtsi PU1 AMUX channels). msm-therm sits next to the SoC:
++ * besides the critical trip it throttles both CPU clusters through cpufreq
++ * from 65 C (only in effect while CPU frequency scaling is loaded).
++ */
++/ {
++	msm_therm: msm-therm {
++		compatible = "generic-adc-thermal";
++		#thermal-sensor-cells = <0>;
++		io-channels = <&pm8994_vadc VADC_LR_MUX4_PU1_AMUX_THM1>;
++		io-channel-names = "sensor-channel";
++	};
++
++	emmc_therm: emmc-therm {
++		compatible = "generic-adc-thermal";
++		#thermal-sensor-cells = <0>;
++		io-channels = <&pm8994_vadc VADC_LR_MUX5_PU1_AMUX_THM2>;
++		io-channel-names = "sensor-channel";
++	};
++
++	pa_therm0: pa-therm0 {
++		compatible = "generic-adc-thermal";
++		#thermal-sensor-cells = <0>;
++		io-channels = <&pm8994_vadc VADC_LR_MUX6_PU1_AMUX_THM3>;
++		io-channel-names = "sensor-channel";
++	};
++
++	pa_therm1: pa-therm1 {
++		compatible = "generic-adc-thermal";
++		#thermal-sensor-cells = <0>;
++		io-channels = <&pm8994_vadc VADC_LR_MUX8_PU1_AMUX_THM4>;
++		io-channel-names = "sensor-channel";
++	};
++
++	quiet_therm: quiet-therm {
++		compatible = "generic-adc-thermal";
++		#thermal-sensor-cells = <0>;
++		io-channels = <&pm8994_vadc VADC_LR_MUX9_PU1_AMUX_THM5>;
++		io-channel-names = "sensor-channel";
++	};
++
++	thermal-zones {
++		msm-therm {
++			polling-delay = <1000>;
++			polling-delay-passive = <250>;
++			thermal-sensors = <&msm_therm>;
++
++			trips {
++				msm_therm_passive: msm-therm-passive {
++					temperature = <65000>;
++					hysteresis = <3000>;
++					type = "passive";
++				};
++
++				msm_therm_crit: msm-therm-crit {
++					temperature = <115000>;
++					hysteresis = <2000>;
++					type = "critical";
++				};
++			};
++
++			cooling-maps {
++				map0 {
++					trip = <&msm_therm_passive>;
++					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
++							 <&cpu1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
++							 <&cpu2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
++							 <&cpu3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
++							 <&cpu4 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
++							 <&cpu5 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
++				};
++			};
++		};
++
++		emmc-therm {
++			polling-delay = <1000>;
++			polling-delay-passive = <250>;
++			thermal-sensors = <&emmc_therm>;
++
++			trips {
++				emmc_therm_crit: emmc-therm-crit {
++					temperature = <115000>;
++					hysteresis = <2000>;
++					type = "critical";
++				};
++			};
++		};
++
++		pa-therm0 {
++			polling-delay = <1000>;
++			polling-delay-passive = <250>;
++			thermal-sensors = <&pa_therm0>;
++
++			trips {
++				pa_therm0_crit: pa-therm0-crit {
++					temperature = <115000>;
++					hysteresis = <2000>;
++					type = "critical";
++				};
++			};
++		};
++
++		pa-therm1 {
++			polling-delay = <1000>;
++			polling-delay-passive = <250>;
++			thermal-sensors = <&pa_therm1>;
++
++			trips {
++				pa_therm1_crit: pa-therm1-crit {
++					temperature = <115000>;
++					hysteresis = <2000>;
++					type = "critical";
++				};
++			};
++		};
++
++		quiet-therm {
++			polling-delay = <1000>;
++			polling-delay-passive = <250>;
++			thermal-sensors = <&quiet_therm>;
++
++			trips {
++				quiet_therm_crit: quiet-therm-crit {
++					temperature = <115000>;
++					hysteresis = <2000>;
++					type = "critical";
++				};
++			};
++		};
++	};
++};
++
++&pm8994_vadc {
++	channel@49 {
++		reg = <VADC_LR_MUX4_PU1_AMUX_THM1>;
++		label = "msm_therm";
++		qcom,ratiometric;
++		qcom,hw-settle-time = <200>;
++	};
++
++	channel@4a {
++		reg = <VADC_LR_MUX5_PU1_AMUX_THM2>;
++		label = "emmc_therm";
++		qcom,ratiometric;
++		qcom,hw-settle-time = <200>;
++	};
++
++	channel@4b {
++		reg = <VADC_LR_MUX6_PU1_AMUX_THM3>;
++		label = "pa_therm0";
++		qcom,ratiometric;
++		qcom,hw-settle-time = <200>;
++	};
++
++	channel@4d {
++		reg = <VADC_LR_MUX8_PU1_AMUX_THM4>;
++		label = "pa_therm1";
++		qcom,ratiometric;
++		qcom,hw-settle-time = <200>;
++	};
++
++	channel@4e {
++		reg = <VADC_LR_MUX9_PU1_AMUX_THM5>;
++		label = "quiet_therm";
++		qcom,ratiometric;
++		qcom,hw-settle-time = <200>;
++	};
++};
++
++/*
++ * Crash log that survives a reboot (EpicLPer: proven on the WP BootMgr path,
++ * and only with no-map). Read it after the next boot from /sys/fs/pstore.
++ */
++&{/reserved-memory} {
++	ramoops@d9d00000 {
++		compatible = "ramoops";
++		reg = <0x0 0xd9d00000 0x0 0x100000>;
++		no-map;
++		record-size = <0x20000>;
++		console-size = <0x80000>;
++		ecc-size = <0>;
++		max-reason = <3>;
++	};
++};

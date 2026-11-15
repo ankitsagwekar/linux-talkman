@@ -1,0 +1,135 @@
+From: Ankit <ankits@outlook.sg>
+Subject: [PATCH] usb: dwc3: qcom-legacy: wake the MSM8994 USB2 PHY via its CSR block
+
+The firmware can leave the USB2 PHY parked through its CSR overrides
+(OVERRIDE_EN, PWRDN_B clear, ref clock buffer off). Map the optional
+second reg (downstream hsphy0 "phy_csr") and run the downstream resume
+sequence before the QSCRATCH init; log the CSR state before/after.
+Also keep Talkman PCIe0 (Wi-Fi) disabled by default until it is fixed.
+---
+diff --git a/arch/arm64/boot/dts/qcom/msm8992-msft-lumia-octagon-talkman.dts b/arch/arm64/boot/dts/qcom/msm8992-msft-lumia-octagon-talkman.dts
+index a6370aa3b..8d33a4e0a 100644
+--- a/arch/arm64/boot/dts/qcom/msm8992-msft-lumia-octagon-talkman.dts
++++ b/arch/arm64/boot/dts/qcom/msm8992-msft-lumia-octagon-talkman.dts
+@@ -41,12 +41,16 @@ &uc120 {
+  * CLKREQ# as pci_e1 mux, WAKE#), i.e. the pins named pcie1_default here
+  * (downstream msm8992-pinctrl.dtsi pcie0_*). Supplies as on Cityman RC1.
+  */
++/*
++ * Wi-Fi bring-up on RC0 is still being debugged: the link does not train and
++ * the second, endpoint-powered pass hangs the SoC. Keep it off by default.
++ */
+ &pciephy0 {
+-	status = "okay";
++	status = "disabled";
+ };
+ 
+ &pcie0 {
+-	status = "okay";
++	status = "disabled";
+ 	pinctrl-names = "default";
+ 	pinctrl-0 = <&pcie1_default &wlan_bootstrap_default>;
+ 	vdda-supply = <&vreg_l28a_1p0>;
+diff --git a/arch/arm64/boot/dts/qcom/msm8994-msft-lumia-octagon.dtsi b/arch/arm64/boot/dts/qcom/msm8994-msft-lumia-octagon.dtsi
+index a5ca16aa8..11b519df8 100644
+--- a/arch/arm64/boot/dts/qcom/msm8994-msft-lumia-octagon.dtsi
++++ b/arch/arm64/boot/dts/qcom/msm8994-msft-lumia-octagon.dtsi
+@@ -997,6 +997,9 @@ &sdhc2 {
+  * the USB gadget is known to work. Host mode via the UC120 comes later.
+  */
+ &usb3 {
++	/* QSCRATCH + USB2 PHY CSR (downstream hsphy0 "phy_csr") */
++	reg = <0xf92f8800 0x400>, <0xf9b3a000 0x110>;
++
+ 	/*
+ 	 * Lumia device-mode USB2 PHY tuning (downstream msm8992-chi.dtsi
+ 	 * &hsphy0 qcom,hsphy-init). Also makes the glue initialise the PHY
+diff --git a/drivers/usb/dwc3/dwc3-qcom-legacy.c b/drivers/usb/dwc3/dwc3-qcom-legacy.c
+index 0afd7879b..676d183b5 100644
+--- a/drivers/usb/dwc3/dwc3-qcom-legacy.c
++++ b/drivers/usb/dwc3/dwc3-qcom-legacy.c
+@@ -53,6 +53,20 @@
+ #define HSPHY_COMMON_CLKCORE			BIT(14)
+ #define HSPHY_COMMON_PLLBTUNE			BIT(15)
+ 
++/* USB2 PHY CSR block (downstream "phy_csr", 0xf9b3a000 on MSM8994/8992) */
++#define USB2PHY_HS_PHY_CTRL_COMMON0		0x78
++#define USB2PHY_COMMONONN			BIT(7)
++#define USB2PHY_RETENABLEN			BIT(3)
++#define USB2PHY_HS_PHY_CTRL2			0x90
++#define USB2PHY_SUSPEND_N_SEL			BIT(7)
++#define USB2PHY_SUSPEND_N			BIT(6)
++#define USB2PHY_USB_PHY_CFG0			0xc4
++#define USB2PHY_OVERRIDE_EN			0x7
++#define USB2PHY_USB_PHY_REFCLK_CTRL		0xe8
++#define USB2PHY_REFCLK_RXTAP_EN			BIT(0)
++#define USB2PHY_USB_PHY_PWRDOWN_CTRL		0xec
++#define USB2PHY_PWRDN_B				BIT(0)
++
+ #define QSCRATCH_SS_PHY_CTRL			0x30
+ #define LANE0_PWR_PRESENT			BIT(24)
+ 
+@@ -162,6 +176,40 @@ static void dwc3_qcom_vbus_override_enable(struct dwc3_qcom *qcom, bool enable)
+ 	}
+ }
+ 
++static void dwc3_qcom_csr_dump(struct dwc3_qcom *qcom, void __iomem *csr,
++			       const char *when)
++{
++	dev_info(qcom->dev,
++		 "USB2PHY CSR %s: COMMON0 0x%02x CTRL2 0x%02x CFG0 0x%02x REFCLK 0x%02x PWRDOWN 0x%02x\n",
++		 when, readl(csr + USB2PHY_HS_PHY_CTRL_COMMON0),
++		 readl(csr + USB2PHY_HS_PHY_CTRL2),
++		 readl(csr + USB2PHY_USB_PHY_CFG0),
++		 readl(csr + USB2PHY_USB_PHY_REFCLK_CTRL),
++		 readl(csr + USB2PHY_USB_PHY_PWRDOWN_CTRL));
++}
++
++/*
++ * Downstream msm_hsphy_set_suspend(0) for core >= 1.60: the firmware may have
++ * parked the PHY in retention through the CSR overrides (PHY powered down,
++ * ref clock buffer off). Undo that and hand control back to the hardware.
++ */
++static void dwc3_qcom_csr_wake(struct dwc3_qcom *qcom, void __iomem *csr)
++{
++	dwc3_qcom_csr_dump(qcom, csr, "before");
++
++	dwc3_qcom_setbits(csr, USB2PHY_USB_PHY_PWRDOWN_CTRL, USB2PHY_PWRDN_B);
++	dwc3_qcom_setbits(csr, USB2PHY_USB_PHY_REFCLK_CTRL,
++			  USB2PHY_REFCLK_RXTAP_EN);
++	dwc3_qcom_setbits(csr, USB2PHY_HS_PHY_CTRL_COMMON0,
++			  USB2PHY_COMMONONN | USB2PHY_RETENABLEN);
++	dwc3_qcom_clrbits(csr, USB2PHY_HS_PHY_CTRL2,
++			  USB2PHY_SUSPEND_N_SEL | USB2PHY_SUSPEND_N);
++	dwc3_qcom_clrbits(csr, USB2PHY_USB_PHY_CFG0, USB2PHY_OVERRIDE_EN);
++	usleep_range(1000, 1200);
++
++	dwc3_qcom_csr_dump(qcom, csr, "after");
++}
++
+ /* Downstream phy-msm-hsusb.c msm_hsphy_init() + resume, device mode */
+ static void dwc3_qcom_snps_hsphy_init(struct dwc3_qcom *qcom, u32 init_seq)
+ {
+@@ -863,7 +911,22 @@ static int dwc3_qcom_probe(struct platform_device *pdev)
+ 
+ 		if (!device_property_read_u32(dev, "qcom,hsphy-init",
+ 					      &hsphy_init)) {
++			struct resource *res;
++
+ 			qcom->snps_hsphy = true;
++
++			/* Optional second reg: the USB2 PHY CSR block */
++			res = platform_get_resource(pdev, IORESOURCE_MEM, 1);
++			if (res) {
++				void __iomem *csr = devm_ioremap(dev, res->start,
++							resource_size(res));
++
++				if (csr)
++					dwc3_qcom_csr_wake(qcom, csr);
++				else
++					dev_warn(dev, "cannot map USB2 PHY CSR\n");
++			}
++
+ 			dwc3_qcom_snps_hsphy_init(qcom, hsphy_init);
+ 		}
+ 	}

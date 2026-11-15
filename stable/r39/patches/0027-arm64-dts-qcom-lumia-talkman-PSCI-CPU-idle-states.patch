@@ -1,0 +1,84 @@
+From: Claude <noreply@anthropic.com>
+Subject: [PATCH] arm64: dts: qcom: lumia-talkman: PSCI CPU idle states
+
+Idle states from EpicLPer 1ccb2e15 ("add MSM8994 PSCI idle and split CPU
+PMUs"), kept in the talkman board file: A53 retention + power collapse, A57
+retention only. Without them the phone draws ~760 mA idle, more than a PC
+USB port supplies.
+
+---
+--- a/arch/arm64/boot/dts/qcom/msm8992-msft-lumia-octagon-talkman.dts	2026-11-14 23:55:29.197479133 +0530
++++ b/arch/arm64/boot/dts/qcom/msm8992-msft-lumia-octagon-talkman.dts	2026-11-14 23:55:49.521341794 +0530
+@@ -231,3 +231,72 @@
+ 		F0 11 30 03 00 00 00 0C
+ 	];
+ };
++
++/*
++ * CPU idle states (EpicLPer 1ccb2e15, tested on the Lumia UEFI's PSCI): the
++ * A53s can retain and power-collapse; the A57s only retain, because this
++ * firmware does not wake them from a CPU_SUSPEND power-down.
++ */
++&{/cpus} {
++	idle-states {
++		entry-method = "psci";
++
++		little_cpu_sleep_0: cpu-sleep-0-0 {
++			compatible = "arm,idle-state";
++			idle-state-name = "little-retention";
++			arm,psci-suspend-param = <0x00000002>;
++			entry-latency-us = <50>;
++			exit-latency-us = <100>;
++			min-residency-us = <313>;
++			local-timer-stop;
++		};
++
++		little_cpu_sleep_1: cpu-sleep-0-1 {
++			compatible = "arm,idle-state";
++			idle-state-name = "little-spc";
++			arm,psci-suspend-param = <0x00010004>;
++			entry-latency-us = <400>;
++			exit-latency-us = <400>;
++			min-residency-us = <2000>;
++			local-timer-stop;
++		};
++
++		big_cpu_sleep_0: cpu-sleep-1-0 {
++			compatible = "arm,idle-state";
++			idle-state-name = "big-retention";
++			arm,psci-suspend-param = <0x00000002>;
++			entry-latency-us = <80>;
++			exit-latency-us = <120>;
++			min-residency-us = <400>;
++			local-timer-stop;
++		};
++	};
++};
++
++&{/psci} {
++	compatible = "arm,psci-1.0";
++};
++
++&cpu0 {
++	cpu-idle-states = <&little_cpu_sleep_0 &little_cpu_sleep_1>;
++};
++
++&cpu1 {
++	cpu-idle-states = <&little_cpu_sleep_0 &little_cpu_sleep_1>;
++};
++
++&cpu2 {
++	cpu-idle-states = <&little_cpu_sleep_0 &little_cpu_sleep_1>;
++};
++
++&cpu3 {
++	cpu-idle-states = <&little_cpu_sleep_0 &little_cpu_sleep_1>;
++};
++
++&cpu4 {
++	cpu-idle-states = <&big_cpu_sleep_0>;
++};
++
++&cpu5 {
++	cpu-idle-states = <&big_cpu_sleep_0>;
++};

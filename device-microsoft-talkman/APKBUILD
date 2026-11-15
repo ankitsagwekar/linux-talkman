@@ -1,0 +1,92 @@
+# Reference: <https://postmarketos.org/devicepkg>
+maintainer="Ankit <ankits@outlook.sg>"
+pkgname=device-microsoft-talkman
+pkgdesc="Microsoft Lumia 950"
+pkgver=1
+pkgrel=8
+url="https://postmarketos.org"
+license="MIT"
+arch="aarch64"
+options="!check !archcheck"
+depends="
+	linux-firmware-ath10k
+	linux-firmware-qca
+	linux-postmarketos-qcom-msm8994
+	postmarketos-base
+	systemd-boot
+"
+makedepends="devicepkg-dev"
+source="
+	deviceinfo
+	kernel-cmdline.conf
+	modules-initfs
+	talkman-usb-debug.sh
+	talkman-usb-debug.service
+	talkman-wifi.sh
+	talkman-wifi.service
+	talkman-cpufreq.sh
+	talkman-cpufreq.service
+	talkman-cpufreq.conf
+	talkman-venus.conf
+	90-talkman-bluetooth-off.rules
+"
+
+build() {
+	devicepkg_build $startdir $pkgname
+}
+
+package() {
+	devicepkg_package $startdir $pkgname
+
+	# Temporary bring-up aid: dumps USB state to /var/log at boot
+	install -Dm755 "$srcdir"/talkman-usb-debug.sh \
+		"$pkgdir"/usr/libexec/talkman-usb-debug.sh
+	install -Dm644 "$srcdir"/talkman-usb-debug.service \
+		"$pkgdir"/usr/lib/systemd/system/talkman-usb-debug.service
+	mkdir -p "$pkgdir"/etc/systemd/system/multi-user.target.wants
+	ln -s /usr/lib/systemd/system/talkman-usb-debug.service \
+		"$pkgdir"/etc/systemd/system/multi-user.target.wants/talkman-usb-debug.service
+
+	# Powers the QCA6174 Wi-Fi chip (PCIe0) once the kernel is up
+	install -Dm755 "$srcdir"/talkman-wifi.sh \
+		"$pkgdir"/usr/libexec/talkman-wifi.sh
+	install -Dm644 "$srcdir"/talkman-wifi.service \
+		"$pkgdir"/usr/lib/systemd/system/talkman-wifi.service
+	ln -s /usr/lib/systemd/system/talkman-wifi.service \
+		"$pkgdir"/etc/systemd/system/multi-user.target.wants/talkman-wifi.service
+
+	# CPU frequency scaling: PARKED. The big (A57) cores still hang the phone
+	# soon after scaling starts, so the loader service is installed but not
+	# enabled, and the modules never auto-load. Enable by hand to test:
+	# systemctl enable talkman-cpufreq (see README).
+	install -Dm755 "$srcdir"/talkman-cpufreq.sh \
+		"$pkgdir"/usr/libexec/talkman-cpufreq.sh
+	install -Dm644 "$srcdir"/talkman-cpufreq.service \
+		"$pkgdir"/usr/lib/systemd/system/talkman-cpufreq.service
+	install -Dm644 "$srcdir"/talkman-cpufreq.conf \
+		"$pkgdir"/etc/modprobe.d/talkman-cpufreq.conf
+
+	# Venus video codec: experimental, not loaded automatically (needs the
+	# Lumia firmware qcvss8994.mbn; load by hand, see README)
+	install -Dm644 "$srcdir"/talkman-venus.conf \
+		"$pkgdir"/etc/modprobe.d/talkman-venus.conf
+
+	# Bluetooth radio off at boot (driver stays loaded: Wi-Fi needs it)
+	install -Dm644 "$srcdir"/90-talkman-bluetooth-off.rules \
+		"$pkgdir"/usr/lib/udev/rules.d/90-talkman-bluetooth-off.rules
+}
+
+sha512sums="
+a8f9507cfd69fd591c726c7560291dd1105751afa97c2adfa738c948d5e445addfce4fad06a234ed179e5525cbd5fc91ba6001d5d82c5aac66f8a0cf1dbd9c8b  deviceinfo
+bae0342330232ce14135232af18125a8ba725f8174af2dfcfd0152c71f50f2e684e29f3f77ba30d033bec7e46bbfc8b4928755853d09a6f5923ee45e318797ba  kernel-cmdline.conf
+0c7334ea88df484644080c0a471ca25fe70adfdb58b0c3078a76fadcf6a684eb537d5510f6e4d84218cdf0d93e05bf8dc4f67b4a488c71dbd88f2ffcd99f5646  modules-initfs
+9762987f20a7d156e3cf7518c209bef5784012ecd55cd6aa0e8d72ab67fd443b2a9e17584b0e94f509847290b29075afbdc97e824c20532cadc7a96ad32defc0  talkman-usb-debug.sh
+7fdaea41267a65c83f50dc8f0ec4a0802aa5e8034b9db773ac115e6c76f08e5e02ed2bfc3c2e7416b769b8a0ff1d6a2326fe4ea3aed94e4a450f9e45ba6957ca  talkman-usb-debug.service
+8012c3488ec581604bf7610b1836fbf7f00ef2463026372a98173b871a447ca059df1bb6f04859b7e496305b4bc9ac1ef16aa888914fdd295bba40272a037207  talkman-wifi.sh
+7e0713f89661feab461fe63cfb69e70186a2d4ed74f767b6d0f1d8b801e490071219df11851a84274172a1cc889a6dc54a63a4124b1ebb0483da5d69612f16da  talkman-wifi.service
+56b7be387b164a00618019fa18cce9a15cff3767c6b09a02deb706bb981223761b1a194f2d7b0039e3cc2a976c226d5d81f5d32d873efba11c118c524f700120  talkman-cpufreq.sh
+2471e8a67f6ef1cb9a3b0f7cd2d2551f3d255d0508e5ae7397bdce1fa8cf93bebd2362caaa48d5fcef806b955865119ed7e9c6ff7aa0bdb8e310ba05add560af  talkman-cpufreq.service
+1e7ca04b6a8e418351c1c66650927dd7ec878f62e68d080fd9bcf429bf39932740d4190b444d86062acb9c51ca2b5631cc78cfb17d1c054df14ca261f84cf909  talkman-cpufreq.conf
+45dbc84d8777d1810981a7d64970ea66a6a5a833da6d63f1d37f9c69ab381b4ab50c636822060dee0f90e8b2d95954df265613d9ad08da24ccef3233d8c77878  talkman-venus.conf
+5afb1d0e07670dc15e7250648467921ae768aadfb818fe0e50231210ad4d2053a9a5f78f3e69d6c1d6640efc355080668c4d017bdd3386c1157f0324a6d00584  90-talkman-bluetooth-off.rules
+"

@@ -1,0 +1,46 @@
+From: Ankit <ankits@outlook.sg>
+Subject: [PATCH] arm64: dts: qcom: lumia-octagon: keep DWC3 in peripheral mode
+
+The USB gadget is known to work on Octagon with dr_mode = "peripheral"
+(Android4Lumia950 / EpicLPer trees). Drop the OTG role-switch wiring to
+the UC120 connector until host mode is brought up separately.
+---
+diff --git a/arch/arm64/boot/dts/qcom/msm8994-msft-lumia-octagon.dtsi b/arch/arm64/boot/dts/qcom/msm8994-msft-lumia-octagon.dtsi
+index 84699a2..cf613e9 100644
+--- a/arch/arm64/boot/dts/qcom/msm8994-msft-lumia-octagon.dtsi
++++ b/arch/arm64/boot/dts/qcom/msm8994-msft-lumia-octagon.dtsi
+@@ -481,12 +481,6 @@ connector {
+ 			try-power-role = "sink";
+ 			data-role = "dual";
+ 			typec-power-opmode = "default";
+-
+-			port {
+-				uc120_hs_out: endpoint {
+-					remote-endpoint = <&usb3_role_switch_in>;
+-				};
+-			};
+ 		};
+ 	};
+ };
+@@ -902,16 +896,12 @@ &sdhc2 {
+ 	cd-gpios = <&pm8994_gpios 8 GPIO_ACTIVE_LOW>;
+ };
+ 
++/*
++ * Peripheral only for now, as in the Android4Lumia950/EpicLPer trees where
++ * the USB gadget is known to work. Host mode via the UC120 comes later.
++ */
+ &usb3_dwc3 {
+-	dr_mode = "otg";
+-	usb-role-switch;
+-	role-switch-default-mode = "peripheral";
+-
+-	port {
+-		usb3_role_switch_in: endpoint {
+-			remote-endpoint = <&uc120_hs_out>;
+-		};
+-	};
++	dr_mode = "peripheral";
+ };
+ 
+ &tlmm {

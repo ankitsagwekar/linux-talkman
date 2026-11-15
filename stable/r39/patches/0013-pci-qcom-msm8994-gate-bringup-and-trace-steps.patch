@@ -1,0 +1,258 @@
+From: Ankit <ankits@outlook.sg>
+Subject: [PATCH] PCI: qcom: msm8994: gate bring-up and trace each step
+
+The Lumia 950 (MSM8992) PCIe0 bring-up freezes the SoC during the second,
+endpoint-powered pass, which leaves no logs. Do not start it at boot: the
+driver returns -ENODEV unless pcie_qcom.msm8994_enable=1, and can then be
+bound by hand (suppress_bind_attrs=false). Every step of the bring-up and
+of the PHY power-on prints a "pcie-trace:" line, so the last line on the
+console after a freeze names the step that hung. DT nodes enabled on
+Talkman again.
+---
+diff --git a/arch/arm64/boot/dts/qcom/msm8992-msft-lumia-octagon-talkman.dts b/arch/arm64/boot/dts/qcom/msm8992-msft-lumia-octagon-talkman.dts
+index 8d33a4e0a..895429b65 100644
+--- a/arch/arm64/boot/dts/qcom/msm8992-msft-lumia-octagon-talkman.dts
++++ b/arch/arm64/boot/dts/qcom/msm8992-msft-lumia-octagon-talkman.dts
+@@ -43,14 +43,15 @@ &uc120 {
+  */
+ /*
+  * Wi-Fi bring-up on RC0 is still being debugged: the link does not train and
+- * the second, endpoint-powered pass hangs the SoC. Keep it off by default.
++ * the second, endpoint-powered pass hangs the SoC. The nodes are enabled but
++ * the driver stays off until started from userspace (pcie_qcom.msm8994_enable).
+  */
+ &pciephy0 {
+-	status = "disabled";
++	status = "okay";
+ };
+ 
+ &pcie0 {
+-	status = "disabled";
++	status = "okay";
+ 	pinctrl-names = "default";
+ 	pinctrl-0 = <&pcie1_default &wlan_bootstrap_default>;
+ 	vdda-supply = <&vreg_l28a_1p0>;
+diff --git a/drivers/pci/controller/dwc/pcie-qcom.c b/drivers/pci/controller/dwc/pcie-qcom.c
+index 82944a78a..2e13e97d6 100644
+--- a/drivers/pci/controller/dwc/pcie-qcom.c
++++ b/drivers/pci/controller/dwc/pcie-qcom.c
+@@ -40,6 +40,20 @@
+ #include "pcie-designware.h"
+ #include "pcie-qcom-common.h"
+ 
++/*
++ * MSM8994/8992 PCIe bring-up is gated and traced while it is being debugged
++ * on the Lumia 950: the first attempt freezes the SoC, so it is not started
++ * at boot. Enable it on demand from userspace:
++ *   echo 1 > /sys/module/pcie_qcom/parameters/msm8994_enable
++ *   echo fc520000.pcie > /sys/bus/platform/drivers/qcom-pcie/bind
++ * Each step prints a "pcie-trace:" line; the last one printed before a
++ * freeze (visible on the console) names the step that hung.
++ */
++static bool msm8994_enable;
++module_param(msm8994_enable, bool, 0644);
++MODULE_PARM_DESC(msm8994_enable, "start the MSM8994/8992 PCIe RC (default off)");
++#define QTRACE(dev, fmt, ...) dev_info(dev, "pcie-trace: " fmt "\n", ##__VA_ARGS__)
++
+ /* PARF registers */
+ #define PARF_SYS_CTRL				0x00
+ #define PARF_PM_CTRL				0x20
+@@ -834,7 +848,9 @@ static int qcom_pcie_init_msm8994(struct qcom_pcie *pcie)
+ 		 */
+ 		usleep_range(2000, 2500);	/* VDDIO (1.8V) settled */
+ 
++		QTRACE(dev, "I1 endpoint rail on");
+ 		ret = qcom_pcie_msm8994_rail(pcie, true);
++		QTRACE(dev, "I2 endpoint rail on done ret=%d", ret);
+ 		if (ret) {
+ 			dev_err(dev, "cannot enable the endpoint rail\n");
+ 			return ret;
+@@ -848,6 +864,7 @@ static int qcom_pcie_init_msm8994(struct qcom_pcie *pcie)
+ 		usleep_range(2000, 2500);
+ 	}
+ 
++	QTRACE(dev, "I3 aux clk rate");
+ 	for (i = 0; i < res->num_clks; i++) {
+ 		if (res->clks[i].id && !strcmp(res->clks[i].id, "aux")) {
+ 			ret = clk_set_rate(res->clks[i].clk, 1011000);
+@@ -859,7 +876,9 @@ static int qcom_pcie_init_msm8994(struct qcom_pcie *pcie)
+ 		}
+ 	}
+ 
++	QTRACE(dev, "I4 clocks enable (%d clocks)", res->num_clks);
+ 	ret = clk_bulk_prepare_enable(res->num_clks, res->clks);
++	QTRACE(dev, "I5 clocks enabled ret=%d", ret);
+ 	if (ret) {
+ 		dev_err(dev, "cannot prepare/enable clocks\n");
+ 		goto err_disable_regulators;
+@@ -877,6 +896,7 @@ static int qcom_pcie_init_msm8994(struct qcom_pcie *pcie)
+ 		}
+ 	}
+ 
++	QTRACE(dev, "I6 PARF writes");
+ 	/* 3.10 PARF: PHY_CTRL bit0 clear, DBI base 0, SYS_CTRL 0x365E. */
+ 	val = readl(pcie->parf + PARF_PHY_CTRL);
+ 	val &= ~PHY_TEST_PWR_DOWN;
+@@ -898,12 +918,14 @@ static int qcom_pcie_init_msm8994(struct qcom_pcie *pcie)
+ 
+ 		of_property_read_u32(dev->of_node, "linux,pci-domain", &domain);
+ 		bcr = domain ? 0x1b40 : 0x1ac0;
++		QTRACE(dev, "I7 block reset toggle (GCC+0x%x)", bcr);
+ 		if (gcc) {
+ 			writel(1, gcc + bcr);
+ 			usleep_range(2000, 2500);
+ 			writel(0, gcc + bcr);
+ 			iounmap(gcc);
+ 		}
++		QTRACE(dev, "I8 block reset done");
+ 	}
+ 
+ 	return 0;
+@@ -984,38 +1006,50 @@ static void qcom_pcie_host_post_msm8994(struct qcom_pcie *pcie)
+ 	if (!dw_pcie_link_up(pci)) {
+ 		dev_info(pci->dev, "first pass trained no link, redoing it powered\n");
+ 
++		QTRACE(pci->dev, "P1 host_deinit start");
+ 		qcom_pcie_host_deinit(pp);
++		QTRACE(pci->dev, "P2 host_deinit done");
+ 
+ 		/*
+ 		 * Power-cycle the endpoint rail so it sees a fresh reset edge,
+ 		 * as the vendor's disable/enable pair does.
+ 		 */
+ 		qcom_pcie_msm8994_rail(pcie, false);
++		QTRACE(pci->dev, "P3 rail off");
+ 		usleep_range(20000, 21000);
+ 
+ 		pcie->second_pass = true;
+ 
++		QTRACE(pci->dev, "P4 host_init start");
+ 		ret = qcom_pcie_host_init(pp);
++		QTRACE(pci->dev, "P5 host_init done ret=%d", ret);
+ 		if (ret) {
+ 			dev_err(pci->dev, "second bring-up failed (%d)\n", ret);
+ 			return;
+ 		}
+ 
++		QTRACE(pci->dev, "P6 setup_rc start");
+ 		ret = dw_pcie_setup_rc(pp);
++		QTRACE(pci->dev, "P7 setup_rc done ret=%d", ret);
+ 		if (ret) {
+ 			dev_err(pci->dev, "setup_rc failed (%d)\n", ret);
+ 			return;
+ 		}
+ 
++		QTRACE(pci->dev, "P8 start_link");
+ 		qcom_pcie_start_link(pci);
+ 
++		QTRACE(pci->dev, "P9 wait_for_link");
+ 		ret = dw_pcie_wait_for_link(pci);
++		QTRACE(pci->dev, "P10 wait_for_link done ret=%d", ret);
+ 		if (ret) {
+ 			dev_err(pci->dev, "endpoint did not answer (%d)\n", ret);
+ 			return;
+ 		}
+ 
++		QTRACE(pci->dev, "P11 rescan bus");
+ 		pci_rescan_bus(pp->bridge->bus);
++		QTRACE(pci->dev, "P12 rescan done");
+ 	}
+ 
+ 	/*
+@@ -1582,9 +1616,12 @@ static int qcom_pcie_host_init(struct dw_pcie_rp *pp)
+ 			return ret;
+ 	}
+ 
++	QTRACE(pci->dev, "H1 reset assert");
+ 	qcom_ep_reset_assert(pcie);
+ 
++	QTRACE(pci->dev, "H2 ops->init");
+ 	ret = pcie->cfg->ops->init(pcie);
++	QTRACE(pci->dev, "H3 ops->init done ret=%d", ret);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -1592,7 +1629,9 @@ static int qcom_pcie_host_init(struct dw_pcie_rp *pp)
+ 	if (ret)
+ 		goto err_deinit;
+ 
++	QTRACE(pci->dev, "H4 phy_power_on");
+ 	ret = phy_power_on(pcie->phy);
++	QTRACE(pci->dev, "H5 phy_power_on done ret=%d", ret);
+ 	if (ret)
+ 		goto err_deinit;
+ 
+@@ -1602,7 +1641,9 @@ static int qcom_pcie_host_init(struct dw_pcie_rp *pp)
+ 			goto err_disable_phy;
+ 	}
+ 
++	QTRACE(pci->dev, "H6 reset deassert");
+ 	qcom_ep_reset_deassert(pcie);
++	QTRACE(pci->dev, "H7 reset deasserted");
+ 
+ 	if (pcie->cfg->ops->config_sid) {
+ 		ret = pcie->cfg->ops->config_sid(pcie);
+@@ -1630,9 +1671,13 @@ static void qcom_pcie_host_deinit(struct dw_pcie_rp *pp)
+ 	struct dw_pcie *pci = to_dw_pcie_from_pp(pp);
+ 	struct qcom_pcie *pcie = to_qcom_pcie(pci);
+ 
++	QTRACE(pci->dev, "D1 reset assert");
+ 	qcom_ep_reset_assert(pcie);
++	QTRACE(pci->dev, "D2 phy_power_off");
+ 	phy_power_off(pcie->phy);
++	QTRACE(pci->dev, "D3 ops->deinit");
+ 	pcie->cfg->ops->deinit(pcie);
++	QTRACE(pci->dev, "D4 deinit done");
+ }
+ 
+ static void qcom_pcie_host_post_init(struct dw_pcie_rp *pp)
+@@ -1963,6 +2008,12 @@ static int qcom_pcie_probe(struct platform_device *pdev)
+ 		return -EINVAL;
+ 	}
+ 
++	if (pcie_cfg->ops == &ops_msm8994 && !msm8994_enable) {
++		dev_info(dev, "MSM8994/8992 PCIe is off (set pcie_qcom.msm8994_enable=1, then bind %s)\n",
++			 dev_name(dev));
++		return -ENODEV;
++	}
++
+ 	pcie = devm_kzalloc(dev, sizeof(*pcie), GFP_KERNEL);
+ 	if (!pcie)
+ 		return -ENOMEM;
+@@ -2263,7 +2314,7 @@ static struct platform_driver qcom_pcie_driver = {
+ 	.probe = qcom_pcie_probe,
+ 	.driver = {
+ 		.name = "qcom-pcie",
+-		.suppress_bind_attrs = true,
++		.suppress_bind_attrs = false,
+ 		.of_match_table = qcom_pcie_match,
+ 		.pm = &qcom_pcie_pm_ops,
+ 		.probe_type = PROBE_PREFER_ASYNCHRONOUS,
+diff --git a/drivers/phy/qualcomm/phy-qcom-qmp-pcie-msm8994.c b/drivers/phy/qualcomm/phy-qcom-qmp-pcie-msm8994.c
+index 6b1bba77b..4f64e0226 100644
+--- a/drivers/phy/qualcomm/phy-qcom-qmp-pcie-msm8994.c
++++ b/drivers/phy/qualcomm/phy-qcom-qmp-pcie-msm8994.c
+@@ -94,6 +94,7 @@ static int qmp_pcie_msm8994_power_on(struct phy *phy)
+ 	u32 val;
+ 	int ret;
+ 
++	dev_info(qmp->dev, "pcie-trace: Y1 phy power_on start\n");
+ 	/* 3.10 clk_init: LDO + PHY BCR deassert with the non-pipe clocks */
+ 	ret = clk_prepare_enable(qmp->ldo);
+ 	if (ret)
+@@ -116,6 +117,7 @@ static int qmp_pcie_msm8994_power_on(struct phy *phy)
+ 	 * reliably on both passes and its end state matches the working vendor
+ 	 * part register-for-register (verified, see notes/wifi-octagon.md).
+ 	 */
++	dev_info(qmp->dev, "pcie-trace: Y2 phy reset deasserted, writing tables\n");
+ 	qmp_write(qmp, PCIE_PHY_POWER_DOWN_CONTROL, 0x03);
+ 	qmp_write(qmp, QSERDES_COM_SYSCLK_EN_SEL_TXBAND, 0x08);
+ 	qmp_write(qmp, QSERDES_COM_DEC_START1, 0x82);
+@@ -163,6 +165,7 @@ static int qmp_pcie_msm8994_power_on(struct phy *phy)
+ 	qmp_write(qmp, PCIE_PHY_RX_IDLE_DTCT_CNTRL, 0x4d);
+ 	qmp_write(qmp, PCIE_PHY_SW_RESET, 0x00);
+ 	qmp_write(qmp, PCIE_PHY_START, 0x03);
++	dev_info(qmp->dev, "pcie-trace: Y3 phy started\n");
+ 
+ 	usleep_range(995, 1005);
+ 

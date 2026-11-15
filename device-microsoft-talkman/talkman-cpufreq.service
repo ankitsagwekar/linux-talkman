@@ -1,0 +1,10 @@
+[Unit]
+Description=CPU frequency scaling for the Lumia 950 (loaded after boot)
+After=multi-user.target talkman-wifi.service
+
+[Service]
+Type=simple
+ExecStart=/usr/libexec/talkman-cpufreq.sh
+
+[Install]
+WantedBy=multi-user.target

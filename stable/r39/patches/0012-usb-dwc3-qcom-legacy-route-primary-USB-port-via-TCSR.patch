@@ -1,0 +1,97 @@
+From: Ankit <ankits@outlook.sg>
+Subject: [PATCH] usb: dwc3: qcom-legacy: route the primary USB port to DWC3 (TCSR)
+
+On MSM8994/8992 a TCSR register (0xFD4AB000 on MSM8992) selects which
+controller owns the primary USB port; after reset it is the USB2 HS
+controller. Downstream dwc3-msm.c writes 1 ("Enable USB3 on the primary
+USB port"). Without it DWC3 and its PHY configure fine but the host
+never sees the device (UDC stays "not attached").
+
+Also vote LN_BB_CLK and DIV_CLK3 (+PMIC GPIO17) as Windows does for USB,
+configuration that was active when USB first worked on the Lumia 950.
+---
+diff --git a/arch/arm64/boot/dts/qcom/msm8994-msft-lumia-octagon.dtsi b/arch/arm64/boot/dts/qcom/msm8994-msft-lumia-octagon.dtsi
+index 11b519d..84dd660 100644
+--- a/arch/arm64/boot/dts/qcom/msm8994-msft-lumia-octagon.dtsi
++++ b/arch/arm64/boot/dts/qcom/msm8994-msft-lumia-octagon.dtsi
+@@ -550,6 +550,18 @@ qca6174_bt: bluetooth {
+ };
+ 
+ &pm8994_gpios {
++	/* PM8994 GPIO 17 = DIV_CLK3 output ("DP_PD_CLK") */
++	divclk3_usb_default: divclk3-usb-state {
++		pinconf {
++			pins = "gpio17";
++			function = PMIC_GPIO_FUNC_FUNC2;
++			power-source = <PM8994_GPIO_S4>;
++			qcom,drive-strength = <PMIC_GPIO_STRENGTH_MED>;
++			output-low;
++			bias-disable;
++		};
++	};
++
+ 	wlan_vreg_default: wlan-vreg-state {
+ 		pinconf {
+ 			pins = "gpio9";
+@@ -997,8 +1009,26 @@ &sdhc2 {
+  * the USB gadget is known to work. Host mode via the UC120 comes later.
+  */
+ &usb3 {
+-	/* QSCRATCH + USB2 PHY CSR (downstream hsphy0 "phy_csr") */
+-	reg = <0xf92f8800 0x400>, <0xf9b3a000 0x110>;
++	/*
++	 * Windows (Lumia ACPI, URS0/UFN0 D0 state) keeps the CXO buffer
++	 * LN_BB_CLK1 and PMIC DIV_CLK_3 on while USB is active; mainline never
++	 * votes for them. The glue driver enables every clock listed here.
++	 */
++	clocks = <&gcc GCC_USB30_MASTER_CLK>,
++		 <&gcc GCC_SYS_NOC_USB3_AXI_CLK>,
++		 <&gcc GCC_USB30_SLEEP_CLK>,
++		 <&gcc GCC_USB30_MOCK_UTMI_CLK>,
++		 <&rpmcc RPM_SMD_LN_BB_CLK>,
++		 <&rpmcc RPM_SMD_DIV_CLK3>;
++	clock-names = "core", "iface", "sleep", "mock_utmi", "xo", "div3";
++	pinctrl-names = "default";
++	pinctrl-0 = <&divclk3_usb_default>;
++
++	/*
++	 * QSCRATCH, USB2 PHY CSR (downstream hsphy0 "phy_csr") and the TCSR
++	 * register that routes the primary USB port to this controller.
++	 */
++	reg = <0xf92f8800 0x400>, <0xf9b3a000 0x110>, <0xfd4ab000 0x4>;
+ 
+ 	/*
+ 	 * Lumia device-mode USB2 PHY tuning (downstream msm8992-chi.dtsi
+diff --git a/drivers/usb/dwc3/dwc3-qcom-legacy.c b/drivers/usb/dwc3/dwc3-qcom-legacy.c
+index 676d183..11085ac 100644
+--- a/drivers/usb/dwc3/dwc3-qcom-legacy.c
++++ b/drivers/usb/dwc3/dwc3-qcom-legacy.c
+@@ -915,6 +915,28 @@ static int dwc3_qcom_probe(struct platform_device *pdev)
+ 
+ 			qcom->snps_hsphy = true;
+ 
++			/*
++			 * Optional third reg: TCSR primary USB port select.
++			 * Downstream dwc3-msm.c: "Enable USB3 on the primary
++			 * USB port". After reset the port belongs to the USB2
++			 * HS controller, so the DWC3 and its PHY configure
++			 * fine but the host never sees the device.
++			 */
++			res = platform_get_resource(pdev, IORESOURCE_MEM, 2);
++			if (res) {
++				void __iomem *tcsr = devm_ioremap(dev, res->start,
++							resource_size(res));
++
++				if (tcsr) {
++					writel(0x1, tcsr);
++					readl(tcsr);	/* flush before touching USB regs */
++					dev_info(dev, "USB port routed to DWC3 (TCSR %pa = 0x%x)\n",
++						 &res->start, readl(tcsr));
++				} else {
++					dev_warn(dev, "cannot map TCSR USB port select\n");
++				}
++			}
++
+ 			/* Optional second reg: the USB2 PHY CSR block */
+ 			res = platform_get_resource(pdev, IORESOURCE_MEM, 1);
+ 			if (res) {

@@ -1,0 +1,153 @@
+From: Ankit <ankits@outlook.sg>
+Subject: [PATCH] usb: dwc3: qcom-legacy: init MSM8994 SNPS HS PHY, enable D+ pull-up
+
+MSM8994/8992 have a Synopsys USB2 PHY controlled through QSCRATCH, with
+no mainline PHY driver. When the bootloader leaves USB untouched (Lumia
+UEFI), the UDC stays "not attached": the PHY is not set up and the D+
+pull-up (VBUSVLDEXT0, with VBUSVLDEXTSEL0) is never enabled.
+
+When "qcom,hsphy-init" is present, run the downstream phy-msm-hsusb.c init
+sequence and also drive VBUSVLDEXT0/VBUSVLDEXTSEL0 with the VBUS override.
+Set the Lumia device-mode tuning value in the Octagon DT.
+---
+diff --git a/arch/arm64/boot/dts/qcom/msm8994-msft-lumia-octagon.dtsi b/arch/arm64/boot/dts/qcom/msm8994-msft-lumia-octagon.dtsi
+index 3060896..e3475b6 100644
+--- a/arch/arm64/boot/dts/qcom/msm8994-msft-lumia-octagon.dtsi
++++ b/arch/arm64/boot/dts/qcom/msm8994-msft-lumia-octagon.dtsi
+@@ -906,6 +906,15 @@ &sdhc2 {
+  * Peripheral only for now, as in the Android4Lumia950/EpicLPer trees where
+  * the USB gadget is known to work. Host mode via the UC120 comes later.
+  */
++&usb3 {
++	/*
++	 * Lumia device-mode USB2 PHY tuning (downstream msm8992-chi.dtsi
++	 * &hsphy0 qcom,hsphy-init). Also makes the glue initialise the PHY
++	 * and drive the D+ pull-up (VBUSVLDEXT0).
++	 */
++	qcom,hsphy-init = <0x00d1d9a4>;
++};
++
+ &usb3_dwc3 {
+ 	dr_mode = "peripheral";
+ };
+diff --git a/drivers/usb/dwc3/dwc3-qcom-legacy.c b/drivers/usb/dwc3/dwc3-qcom-legacy.c
+index d3fad0f..0afd787 100644
+--- a/drivers/usb/dwc3/dwc3-qcom-legacy.c
++++ b/drivers/usb/dwc3/dwc3-qcom-legacy.c
+@@ -29,6 +29,30 @@
+ #define UTMI_OTG_VBUS_VALID			BIT(20)
+ #define SW_SESSVLD_SEL				BIT(28)
+ 
++/*
++ * MSM8994/MSM8992 integrated Synopsys USB2 PHY, controlled through QSCRATCH.
++ * Mainline has no PHY driver for it; on bootloaders that do not bring USB
++ * up (e.g. Lumia UEFI) the PHY must be initialised here, following the
++ * downstream phy-msm-hsusb.c sequence.
++ */
++#define HSPHY_RETENABLEN			BIT(1)
++#define HSPHY_VBUSVLDEXT0			BIT(13)	/* D+ pull-up */
++#define HSPHY_USB2_UTMI_CLK_EN			BIT(21)
++#define HSPHY_USB2_SUSPEND_N_SEL		BIT(23)
++#define HSPHY_CLAMP_MPM_DPSE_DMSE_EN_N		BIT(26)
++#define QSCRATCH_PARAMETER_OVERRIDE_X		0x14
++#define HSPHY_PARAM_MASK			0x03ffffff
++#define QSCRATCH_HS_PHY_CTRL_COMMON		0xec
++#define HSPHY_COMMON_RETENABLEN			BIT(3)
++#define HSPHY_COMMON_FSEL			(0x7 << 4)
++#define HSPHY_COMMON_COMMONONN			BIT(7)
++#define HSPHY_COMMON_OTGTUNE0_MASK		(0x7 << 8)
++#define HSPHY_COMMON_OTGTUNE0_DEFAULT		(0x4 << 8)
++#define HSPHY_COMMON_OTGDISABLE0		BIT(11)
++#define HSPHY_COMMON_VBUSVLDEXTSEL0		BIT(12)
++#define HSPHY_COMMON_CLKCORE			BIT(14)
++#define HSPHY_COMMON_PLLBTUNE			BIT(15)
++
+ #define QSCRATCH_SS_PHY_CTRL			0x30
+ #define LANE0_PWR_PRESENT			BIT(24)
+ 
+@@ -86,6 +110,7 @@ struct dwc3_qcom {
+ 	struct notifier_block	host_nb;
+ 
+ 	enum usb_dr_mode	mode;
++	bool			snps_hsphy;
+ 	bool			is_suspended;
+ 	bool			pm_suspended;
+ 	struct icc_path		*icc_path_ddr;
+@@ -119,18 +144,58 @@ static inline void dwc3_qcom_clrbits(void __iomem *base, u32 offset, u32 val)
+ static void dwc3_qcom_vbus_override_enable(struct dwc3_qcom *qcom, bool enable)
+ {
+ 	if (enable) {
++		if (qcom->snps_hsphy)
++			dwc3_qcom_setbits(qcom->qscratch_base,
++					  QSCRATCH_HS_PHY_CTRL_COMMON,
++					  HSPHY_COMMON_VBUSVLDEXTSEL0);
+ 		dwc3_qcom_setbits(qcom->qscratch_base, QSCRATCH_SS_PHY_CTRL,
+ 				  LANE0_PWR_PRESENT);
+ 		dwc3_qcom_setbits(qcom->qscratch_base, QSCRATCH_HS_PHY_CTRL,
+-				  UTMI_OTG_VBUS_VALID | SW_SESSVLD_SEL);
++				  UTMI_OTG_VBUS_VALID | SW_SESSVLD_SEL |
++				  (qcom->snps_hsphy ? HSPHY_VBUSVLDEXT0 : 0));
+ 	} else {
+ 		dwc3_qcom_clrbits(qcom->qscratch_base, QSCRATCH_SS_PHY_CTRL,
+ 				  LANE0_PWR_PRESENT);
+ 		dwc3_qcom_clrbits(qcom->qscratch_base, QSCRATCH_HS_PHY_CTRL,
+-				  UTMI_OTG_VBUS_VALID | SW_SESSVLD_SEL);
++				  UTMI_OTG_VBUS_VALID | SW_SESSVLD_SEL |
++				  (qcom->snps_hsphy ? HSPHY_VBUSVLDEXT0 : 0));
+ 	}
+ }
+ 
++/* Downstream phy-msm-hsusb.c msm_hsphy_init() + resume, device mode */
++static void dwc3_qcom_snps_hsphy_init(struct dwc3_qcom *qcom, u32 init_seq)
++{
++	void __iomem *base = qcom->qscratch_base;
++	u32 val;
++
++	/* Enable UTMI clock, clamp HV interrupts, leave retention */
++	val = readl(base + QSCRATCH_HS_PHY_CTRL);
++	val |= HSPHY_USB2_UTMI_CLK_EN | HSPHY_CLAMP_MPM_DPSE_DMSE_EN_N |
++	       HSPHY_RETENABLEN;
++	/* Let the controller drive suspend_n (PHY out of suspend) */
++	val &= ~HSPHY_USB2_SUSPEND_N_SEL;
++	writel(val, base + QSCRATCH_HS_PHY_CTRL);
++	usleep_range(2000, 2200);
++
++	val = readl(base + QSCRATCH_HS_PHY_CTRL_COMMON);
++	val &= ~(HSPHY_COMMON_OTGTUNE0_MASK | HSPHY_COMMON_FSEL |
++		 HSPHY_COMMON_OTGDISABLE0);
++	val |= HSPHY_COMMON_OTGTUNE0_DEFAULT | HSPHY_COMMON_COMMONONN |
++	       HSPHY_COMMON_RETENABLEN | HSPHY_COMMON_PLLBTUNE |
++	       HSPHY_COMMON_CLKCORE;
++	writel(val, base + QSCRATCH_HS_PHY_CTRL_COMMON);
++
++	val = readl(base + QSCRATCH_PARAMETER_OVERRIDE_X);
++	val &= ~HSPHY_PARAM_MASK;
++	val |= init_seq & HSPHY_PARAM_MASK;
++	writel(val, base + QSCRATCH_PARAMETER_OVERRIDE_X);
++	readl(base + QSCRATCH_PARAMETER_OVERRIDE_X);
++
++	dev_info(qcom->dev, "SNPS HS PHY init 0x%08x, HS_PHY_CTRL 0x%08x, COMMON 0x%08x\n",
++		 init_seq, readl(base + QSCRATCH_HS_PHY_CTRL),
++		 readl(base + QSCRATCH_HS_PHY_CTRL_COMMON));
++}
++
+ static int dwc3_qcom_vbus_notifier(struct notifier_block *nb,
+ 				   unsigned long event, void *ptr)
+ {
+@@ -793,6 +858,16 @@ static int dwc3_qcom_probe(struct platform_device *pdev)
+ 	if (ignore_pipe_clk)
+ 		dwc3_qcom_select_utmi_clk(qcom);
+ 
++	{
++		u32 hsphy_init;
++
++		if (!device_property_read_u32(dev, "qcom,hsphy-init",
++					      &hsphy_init)) {
++			qcom->snps_hsphy = true;
++			dwc3_qcom_snps_hsphy_init(qcom, hsphy_init);
++		}
++	}
++
+ 	ret = dwc3_qcom_of_register_core(pdev);
+ 	if (ret) {
+ 		dev_err(dev, "failed to register DWC3 Core, err=%d\n", ret);

@@ -1,0 +1,43 @@
+From: sonic011gamer (Android4Lumia950)
+Subject: [PATCH] arm64: dts: qcom: lumia-octagon: fix hall sensors and camera focus key
+
+From https://github.com/Android4Lumia950/linux commits fc3eac02f8 and
+113fcb4049:
+
+- The hall sensors are active-low. As active-high, SW_LID always reads
+  closed and the phone suspends right after boot.
+- The camera half-press button reported KEY_VOLUMEUP. The pmOS
+  initramfs treats a held volume-up as "halt boot" and drops to the
+  debug shell; report KEY_CAMERA_FOCUS instead.
+---
+diff --git a/arch/arm64/boot/dts/qcom/msm8994-msft-lumia-octagon.dtsi b/arch/arm64/boot/dts/qcom/msm8994-msft-lumia-octagon.dtsi
+index 37b41ea31..890baf556 100644
+--- a/arch/arm64/boot/dts/qcom/msm8994-msft-lumia-octagon.dtsi
++++ b/arch/arm64/boot/dts/qcom/msm8994-msft-lumia-octagon.dtsi
+@@ -85,7 +85,7 @@ camfocus-key {
+ 			label = "Camera Focus";
+ 			gpios = <&pm8994_gpios 5 GPIO_ACTIVE_LOW>;
+ 			linux,input-type = <1>;
+-			linux,code = <KEY_VOLUMEUP>;
++			linux,code = <KEY_CAMERA_FOCUS>;
+ 			wakeup-source;
+ 			debounce-interval = <15>;
+ 		};
+@@ -101,7 +101,7 @@ gpio-hall-sensor {
+ 
+ 		event-hall-front-sensor {
+ 			label = "Hall Effect Front Sensor";
+-			gpios = <&tlmm 42 GPIO_ACTIVE_HIGH>;
++			gpios = <&tlmm 42 GPIO_ACTIVE_LOW>;
+ 			linux,input-type = <EV_SW>;
+ 			linux,code = <SW_LID>;
+ 			linux,can-disable;
+@@ -109,7 +109,7 @@ event-hall-front-sensor {
+ 
+ 		event-hall-back-sensor {
+ 			label = "Hall Effect Back Sensor";
+-			gpios = <&tlmm 75 GPIO_ACTIVE_HIGH>;
++			gpios = <&tlmm 75 GPIO_ACTIVE_LOW>;
+ 			linux,input-type = <EV_SW>;
+ 			linux,code = <SW_MACHINE_COVER>;
+ 			linux,can-disable;

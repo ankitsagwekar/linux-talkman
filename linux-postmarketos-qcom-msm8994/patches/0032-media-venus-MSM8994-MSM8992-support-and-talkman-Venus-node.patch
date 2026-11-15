@@ -1,0 +1,245 @@
+From: Claude <noreply@anthropic.com>
+Subject: [PATCH] media: venus: MSM8994/MSM8992 support, talkman Venus node
+
+Venus on MSM8994/MSM8992 runs VE.1.x firmware (HFI 1xx, like MSM8916) with
+two codec cores. Add qcom,msm8994-venus with the vendor clock table and
+register presets, and pm ops that switch the per-core clocks (the core
+power domains sit on the decoder/encoder devices; there is no wrapper
+power-control register). The Venus IOMMU sits inside the Venus register block, so
+map the block without reserving it when the region is already taken.
+
+Talkman: Venus IOMMU and video codec nodes, the Windows video carveout
+(venus_mem) and the Lumia firmware qcvss8994.mbn.
+
+---
+diff --git a/arch/arm64/boot/dts/qcom/msm8992-msft-lumia-octagon-talkman.dts b/arch/arm64/boot/dts/qcom/msm8992-msft-lumia-octagon-talkman.dts
+index 50bdee1..9ebece3 100644
+--- a/arch/arm64/boot/dts/qcom/msm8992-msft-lumia-octagon-talkman.dts
++++ b/arch/arm64/boot/dts/qcom/msm8992-msft-lumia-octagon-talkman.dts
+@@ -497,3 +497,77 @@
+ 	/delete-node/ camsnap-key;
+ 	/delete-node/ camfocus-key;
+ };
++
++/*
++ * Venus video codec (H.264/MPEG-2/MPEG-4/VC-1/VP8), HFI 1xx. Firmware: the
++ * Lumia's own Windows\System32\qcvss8994.mbn, authenticated by the secure
++ * world (PAS 9) and loaded into the Windows video carveout (venus_mem).
++ * IOMMU node from EpicLPer's msm8994 tree.
++ */
++&soc {
++	venus_iommu: iommu@fdc84000 {
++		compatible = "qcom,msm8974-venus-iommu";
++		reg = <0xfdc84000 0x2600>;
++		#address-cells = <1>;
++		#size-cells = <1>;
++		#iommu-cells = <1>;
++		ranges = <0 0xfdc8c000 0x3000>;
++
++		clocks = <&mmcc VENUS0_AHB_CLK>,
++			 <&mmcc VENUS0_AXI_CLK>,
++			 <&mmcc VENUS0_VCODEC0_CLK>;
++		clock-names = "iface", "bus", "tbu";
++		power-domains = <&mmcc VENUS_GDSC>;
++		qcom,iommu-secure-id = <0>;
++
++		/* VENUS_NS */
++		iommu-ctx@0 {
++			compatible = "qcom,msm-iommu-v1-ns";
++			reg = <0x0 0x1000>;
++			interrupts = <GIC_SPI 42 IRQ_TYPE_LEVEL_HIGH>;
++		};
++
++		/* VENUS_CP */
++		iommu-ctx@1000 {
++			compatible = "qcom,msm-iommu-v1-sec";
++			reg = <0x1000 0x1000>;
++			interrupts = <GIC_SPI 42 IRQ_TYPE_LEVEL_HIGH>;
++		};
++
++		/* VENUS_FW */
++		iommu-ctx@2000 {
++			compatible = "qcom,msm-iommu-v1-sec";
++			reg = <0x2000 0x1000>;
++			interrupts = <GIC_SPI 42 IRQ_TYPE_LEVEL_HIGH>;
++		};
++	};
++
++	venus: video-codec@fdc00000 {
++		compatible = "qcom,msm8994-venus";
++		reg = <0xfdc00000 0xff000>;
++		interrupts = <GIC_SPI 44 IRQ_TYPE_LEVEL_HIGH>;
++		power-domains = <&mmcc VENUS_GDSC>;
++		clocks = <&mmcc VENUS0_VCODEC0_CLK>,
++			 <&mmcc VENUS0_AHB_CLK>,
++			 <&mmcc VENUS0_AXI_CLK>,
++			 <&mmcc VENUS0_OCMEMNOC_CLK>;
++		clock-names = "core", "iface", "bus", "mbus";
++		iommus = <&venus_iommu 0>;
++		memory-region = <&venus_mem>;
++		firmware-name = "qcom/msm8994/microsoft/qcvss8994.mbn";
++
++		video-decoder {
++			compatible = "venus-decoder";
++			clocks = <&mmcc VENUS0_CORE0_VCODEC_CLK>;
++			clock-names = "core";
++			power-domains = <&mmcc VENUS_CORE0_GDSC>;
++		};
++
++		video-encoder {
++			compatible = "venus-encoder";
++			clocks = <&mmcc VENUS0_CORE1_VCODEC_CLK>;
++			clock-names = "core";
++			power-domains = <&mmcc VENUS_CORE1_GDSC>;
++		};
++	};
++};
+diff --git a/drivers/media/platform/qcom/venus/core.c b/drivers/media/platform/qcom/venus/core.c
+index d305d74..cf0423f 100644
+--- a/drivers/media/platform/qcom/venus/core.c
++++ b/drivers/media/platform/qcom/venus/core.c
+@@ -382,6 +382,19 @@ static int venus_probe(struct platform_device *pdev)
+ 	core->dev = dev;
+ 
+ 	core->base = devm_platform_ioremap_resource(pdev, 0);
++	if (PTR_ERR_OR_ZERO(core->base) == -EBUSY) {
++		/*
++		 * MSM8994/MSM8992: the Venus IOMMU registers (0xfdc84000) sit
++		 * inside the Venus block and are already claimed by the IOMMU
++		 * driver. Map the block without reserving it, as the vendor
++		 * driver did.
++		 */
++		struct resource *r = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++
++		core->base = r ? devm_ioremap(dev, r->start, resource_size(r)) : NULL;
++		if (!core->base)
++			return -ENOMEM;
++	}
+ 	if (IS_ERR(core->base))
+ 		return PTR_ERR(core->base);
+ 
+@@ -403,7 +416,10 @@ static int venus_probe(struct platform_device *pdev)
+ 
+ 	mutex_init(&core->pm_lock);
+ 
+-	core->pm_ops = venus_pm_get(core->res->hfi_version);
++	if (core->res->hfi_version == HFI_VERSION_1XX && core->res->vcodec_clks_num)
++		core->pm_ops = venus_pm_get_v1_vcodec();
++	else
++		core->pm_ops = venus_pm_get(core->res->hfi_version);
+ 	if (!core->pm_ops)
+ 		return -ENODEV;
+ 
+@@ -675,6 +691,40 @@ static const struct venus_resources msm8916_res = {
+ 	.enc_nodename = "video-encoder",
+ };
+ 
++/* MSM8994 / MSM8992 (Lumia 950 family): Venus VE.1.x firmware, HFI 1xx */
++static const struct freq_tbl msm8994_freq_table[] = {
++	{ 783360, 510000000 },	/* 4k @ 30 */
++	{ 489600, 320000000 },	/* 1080p @ 60 */
++	{ 244800, 133330000 },	/* 1080p @ 30 */
++};
++
++static const struct reg_val msm8994_reg_preset[] = {
++	{ 0x800d8, 0x00000707 },
++	{ 0xe0020, 0x55555556 },
++	{ 0xe0024, 0x55555556 },
++	{ 0x80034, 0x02aa0000 },
++	{ 0x80124, 0x00000003 },
++};
++
++static const struct venus_resources msm8994_res = {
++	.freq_tbl = msm8994_freq_table,
++	.freq_tbl_size = ARRAY_SIZE(msm8994_freq_table),
++	.reg_tbl = msm8994_reg_preset,
++	.reg_tbl_size = ARRAY_SIZE(msm8994_reg_preset),
++	.clks = { "core", "iface", "bus", "mbus" },
++	.clks_num = 4,
++	.vcodec0_clks = { "core" },
++	.vcodec1_clks = { "core" },
++	.vcodec_clks_num = 1,
++	.max_load = 1281600,	/* 4k @ 30 + 1080p @ 30 */
++	.hfi_version = HFI_VERSION_1XX,
++	.vmem_id = VIDC_RESOURCE_NONE,
++	.vmem_size = 0,
++	.vmem_addr = 0,
++	.dma_mask = 0xddc00000 - 1,
++	.fwname = "qcom/msm8994/venus.mbn",
++};
++
+ static const struct freq_tbl msm8996_freq_table[] = {
+ 	{ 1944000, 520000000 },	/* 4k UHD @ 60 (decode only) */
+ 	{  972000, 520000000 },	/* 4k UHD @ 30 */
+@@ -1059,6 +1109,7 @@ static const struct venus_resources sc7280_res = {
+ 
+ static const struct of_device_id venus_dt_match[] = {
+ 	{ .compatible = "qcom,msm8916-venus", .data = &msm8916_res, },
++	{ .compatible = "qcom,msm8994-venus", .data = &msm8994_res, },
+ 	{ .compatible = "qcom,msm8996-venus", .data = &msm8996_res, },
+ 	{ .compatible = "qcom,msm8998-venus", .data = &msm8998_res, },
+ 	{ .compatible = "qcom,sdm660-venus", .data = &sdm660_res, },
+diff --git a/drivers/media/platform/qcom/venus/pm_helpers.c b/drivers/media/platform/qcom/venus/pm_helpers.c
+index 409aa9b..e035db7 100644
+--- a/drivers/media/platform/qcom/venus/pm_helpers.c
++++ b/drivers/media/platform/qcom/venus/pm_helpers.c
+@@ -406,6 +406,47 @@ static const struct venus_pm_ops pm_ops_v3 = {
+ 	.load_scale = load_scale_v1,
+ };
+ 
++/*
++ * HFI 1xx Venus with two codec cores (MSM8994/MSM8992): each core has its own
++ * clock and power domain (on the decoder/encoder device) but no wrapper
++ * power-control register, so only the clock is switched here.
++ */
++static int vdec_power_v1_vcodec(struct device *dev, int on)
++{
++	struct venus_core *core = dev_get_drvdata(dev);
++
++	if (on == POWER_ON)
++		return vcodec_clks_enable(core, core->vcodec0_clks);
++	vcodec_clks_disable(core, core->vcodec0_clks);
++	return 0;
++}
++
++static int venc_power_v1_vcodec(struct device *dev, int on)
++{
++	struct venus_core *core = dev_get_drvdata(dev);
++
++	if (on == POWER_ON)
++		return vcodec_clks_enable(core, core->vcodec1_clks);
++	vcodec_clks_disable(core, core->vcodec1_clks);
++	return 0;
++}
++
++static const struct venus_pm_ops pm_ops_v1_vcodec = {
++	.core_get = core_get_v1,
++	.core_put = core_put_v1,
++	.core_power = core_power_v1,
++	.vdec_get = vdec_get_v3,
++	.vdec_power = vdec_power_v1_vcodec,
++	.venc_get = venc_get_v3,
++	.venc_power = venc_power_v1_vcodec,
++	.load_scale = load_scale_v1,
++};
++
++const struct venus_pm_ops *venus_pm_get_v1_vcodec(void)
++{
++	return &pm_ops_v1_vcodec;
++}
++
+ static int vcodec_control_v4(struct venus_core *core, u32 coreid, bool enable)
+ {
+ 	void __iomem *ctrl, *stat;
+diff --git a/drivers/media/platform/qcom/venus/pm_helpers.h b/drivers/media/platform/qcom/venus/pm_helpers.h
+index a492c50..68cad21 100644
+--- a/drivers/media/platform/qcom/venus/pm_helpers.h
++++ b/drivers/media/platform/qcom/venus/pm_helpers.h
+@@ -28,6 +28,7 @@ struct venus_pm_ops {
+ };
+ 
+ const struct venus_pm_ops *venus_pm_get(enum hfi_version version);
++const struct venus_pm_ops *venus_pm_get_v1_vcodec(void);
+ 
+ static inline int venus_pm_load_scale(struct venus_inst *inst)
+ {

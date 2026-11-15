@@ -1,0 +1,7 @@
+simpledrm
+phy-qcom-qusb2
+libcomposite
+usb_f_ncm
+usb_f_rndis
+uc120
+qcom-smbchg

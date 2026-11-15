@@ -1,0 +1,1553 @@
+From: Stefan (EpicLPer) / Ankit <ankits@outlook.sg>
+Subject: [PATCH] lumia-octagon: MSM8994/8992 PCIe RC + QCA6174A Wi-Fi
+
+Backport of EpicLPer/linux commits 7bedb9e313 and 003190c3e3 (PCIe DWC
+support for qcom,pcie-msm8994, 20nm QMP PCIe PHY driver, gcc pipe/aux
+parents, ECRC opt-out, QCA6174A power and pin setup) to 6.16, verified
+upstream on a Lumia 950 XL.
+
+Talkman (MSM8992) additions:
+- enable RC0 (pcie0) with the 8992 pins TLMM 35/36/37 (pcie1_default
+  group), as in downstream msm8992-pinctrl.dtsi;
+- toggle the right block reset per RC (GCC_PCIE_0_BCR 0x1ac0 for RC0,
+  GCC_PCIE_1_BCR 0x1b40 for RC1) instead of always PCIe1;
+- pwrseq-qcom-wcn changes dropped (no consumer, needs newer pwrseq API).
+---
+diff --git a/arch/arm64/boot/dts/qcom/msm8992-msft-lumia-octagon-talkman.dts b/arch/arm64/boot/dts/qcom/msm8992-msft-lumia-octagon-talkman.dts
+index db3c4d4b1..a6370aa3b 100644
+--- a/arch/arm64/boot/dts/qcom/msm8992-msft-lumia-octagon-talkman.dts
++++ b/arch/arm64/boot/dts/qcom/msm8992-msft-lumia-octagon-talkman.dts
+@@ -35,3 +35,26 @@ &pmi8994_smbchg {
+ &uc120 {
+ 	vbus-supply = <&pmi8994_otg>;
+ };
++
++/*
++ * QCA6174A Wi-Fi on PCIe RC0. On MSM8992 RC0 uses TLMM 35/36/37 (PERST#,
++ * CLKREQ# as pci_e1 mux, WAKE#), i.e. the pins named pcie1_default here
++ * (downstream msm8992-pinctrl.dtsi pcie0_*). Supplies as on Cityman RC1.
++ */
++&pciephy0 {
++	status = "okay";
++};
++
++&pcie0 {
++	status = "okay";
++	pinctrl-names = "default";
++	pinctrl-0 = <&pcie1_default &wlan_bootstrap_default>;
++	vdda-supply = <&vreg_l28a_1p0>;
++	vddpe-3v3-supply = <&wlan_en>;
++	qcom,no-ecrc;
++	wake-gpios = <&tlmm 37 GPIO_ACTIVE_LOW>;
++
++	pcie@0 {
++		reset-gpios = <&tlmm 35 GPIO_ACTIVE_LOW>;
++	};
++};
+diff --git a/arch/arm64/boot/dts/qcom/msm8992.dtsi b/arch/arm64/boot/dts/qcom/msm8992.dtsi
+index b2dc46c25..b744732f7 100644
+--- a/arch/arm64/boot/dts/qcom/msm8992.dtsi
++++ b/arch/arm64/boot/dts/qcom/msm8992.dtsi
+@@ -13,8 +13,14 @@
+ 
+ &gcc {
+ 	compatible = "qcom,gcc-msm8992";
++	clock-names = "xo", "sleep", "pcie_0_pipe";
++	clocks = <&xo_board>, <&sleep_clk>, <&pciephy0>;
+ };
+ 
++/* 8992 has no PCIe1. Cityman WiFi is 8994 pcie1. */
++/delete-node/ &pcie1;
++/delete-node/ &pciephy1;
++
+ &mmcc {
+ 	compatible = "qcom,mmcc-msm8992";
+ 
+diff --git a/arch/arm64/boot/dts/qcom/msm8994-msft-lumia-octagon-cityman.dts b/arch/arm64/boot/dts/qcom/msm8994-msft-lumia-octagon-cityman.dts
+index c59341820..10e4d27a2 100644
+--- a/arch/arm64/boot/dts/qcom/msm8994-msft-lumia-octagon-cityman.dts
++++ b/arch/arm64/boot/dts/qcom/msm8994-msft-lumia-octagon-cityman.dts
+@@ -14,3 +14,52 @@ / {
+ 	compatible = "microsoft,cityman", "qcom,msm8994";
+ 	chassis-type = "handset";
+ };
++
++&pciephy1 {
++	status = "okay";
++	vdda-supply = <&vreg_l12a_1p8>;
++};
++
++&pcie1 {
++	status = "okay";
++	pinctrl-names = "default";
++	/*
++	 * `pcie1_default` also carries the CNSS bootstrap pin (TLMM 112): it is
++	 * applied before ops->init() raises WLAN_EN, so the endpoint sees the
++	 * vendor's order (bootstrap high -> >=10 ms -> WLAN_EN -> RC bring-up).
++	 */
++	pinctrl-0 = <&pcie1_default &wlan_bootstrap_default>;
++	vdda-supply = <&vreg_l28a_1p0>;
++	vddpe-3v3-supply = <&wlan_en>;
++
++	/*
++	 * Do not let the DWC ATU force a TLP Digest (ECRC) onto outgoing TLPs.
++	 * On cores older than 5.10A the ATU 'TD' bit overrides the ECRC setting,
++	 * so mainline appends a TLP Digest to every TLP the ATU translates. The
++	 * vendor 3.10 stack never programs it: its live dump reads
++	 * iATU CTRL1 = 0x00000004 (transaction type only) where mainline reads
++	 * 0x00000104, and on an EP that enumerates the difference is real. 3.10
++	 * has no ECRC/TD handling in its DWC at all.
++	 */
++	qcom,no-ecrc;
++
++	/*
++	 * 3.10 pci-msm has `wake-gpio = <&msm_gpio 37 0>` on this node and
++	 * requests it as a falling-edge IRQ ("msm_pcie_wake"). The Lumia DT
++	 * deletes `qcom,ep-wakeirq` (msm8994-chi.dtsi), so enumeration is not
++	 * gated on it there - but the line is wired and worth watching:
++	 * asserted (low) means the endpoint wants the host's attention.
++	 */
++	wake-gpios = <&tlmm 37 GPIO_ACTIVE_LOW>;
++
++	/*
++	 * PERST# is an endpoint property and belongs on the port node:
++	 * with `perst-gpios` on the Root Complex, qcom_pcie_parse_perst()
++	 * falls back to it and warns "DT needs to be fixed!" instead of
++	 * driving the port's own reset-gpios.
++	 */
++	pcie@0 {
++		reset-gpios = <&tlmm 35 GPIO_ACTIVE_LOW>;
++	};
++};
++
+diff --git a/arch/arm64/boot/dts/qcom/msm8994-msft-lumia-octagon.dtsi b/arch/arm64/boot/dts/qcom/msm8994-msft-lumia-octagon.dtsi
+index e3475b69f..a5ca16aa8 100644
+--- a/arch/arm64/boot/dts/qcom/msm8994-msft-lumia-octagon.dtsi
++++ b/arch/arm64/boot/dts/qcom/msm8994-msft-lumia-octagon.dtsi
+@@ -59,6 +59,59 @@ divclk4: divclk4 {
+ 		};
+ 	};
+ 
++	/*
++	 * QCA6174 as a power-sequencing provider (models the WLAN PMU via
++	 * pwrseq-qcom-wcn). The discrete
++	 * Rome chip is powered by the PCIe PHY rail (vdda), the module enable
++	 * line (vddpe-3v3 = wlan_en), and clocked by the 32.768 kHz sleep clock
++	 * (divclk4). The provider enables them in order before the RC is trained.
++	 */
++	wcn_pmu: power-sequencer {
++		compatible = "qcom,qca6174-pmu";
++		vdda-supply = <&vreg_l28a_1p0>;
++		vddpe-3v3-supply = <&wlan_en>;
++		clocks = <&divclk4>;
++		#power-domain-cells = <0>;
++	};
++
++	/*
++	 * 3.10 bt_vreg / wlan_vreg share PM8994 GPIO 9
++	 * (WLAN_LDO_3V_CTRL). QCA6174 chip enable is TLMM 113.
++	 */
++	wlan_vreg: wlan-vreg {
++		compatible = "regulator-fixed";
++		regulator-name = "wlan-vreg";
++		regulator-min-microvolt = <3300000>;
++		regulator-max-microvolt = <3300000>;
++		gpio = <&pm8994_gpios 9 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++		startup-delay-us = <4000>;
++		/*
++		 * This pin is the enable of the module's 3.3 V LDO (vendor name
++		 * `bt-vdd-pa`/`vdd-wlan`). The vendor DT configures PM8994 GPIO 9
++		 * with `vin-sel = PM8994_GPIO_VPH` (it is the only output in that
++		 * node not using vin-sel=<2>); without an explicit pin state
++		 * mainline keeps the firmware's VIN2 (1.8 V) source, which can
++		 * leave the LDO's EN threshold unmet.
++		 */
++		pinctrl-names = "default";
++		pinctrl-0 = <&wlan_vreg_default &wlan_clk_default>;
++	};
++
++	wlan_en: wlan-en {
++		compatible = "regulator-fixed";
++		regulator-name = "wlan-en";
++		regulator-min-microvolt = <3300000>;
++		regulator-max-microvolt = <3300000>;
++		gpio = <&tlmm 113 GPIO_ACTIVE_HIGH>;
++		vin-supply = <&wlan_vreg>;
++		enable-active-high;
++		pinctrl-names = "default";
++		pinctrl-0 = <&wlan_en_default>;
++		/* match the working msm8996-xiaomi-common QCA6174a wlan_en delay */
++		startup-delay-us = <70000>;
++	};
++
+ 	gpio-keys {
+ 		compatible = "gpio-keys";
+ 		autorepeat;
+@@ -497,6 +550,33 @@ qca6174_bt: bluetooth {
+ };
+ 
+ &pm8994_gpios {
++	wlan_vreg_default: wlan-vreg-state {
++		pinconf {
++			pins = "gpio9";
++			function = PMIC_GPIO_FUNC_NORMAL;
++			power-source = <PM8994_GPIO_VPH>;
++			bias-disable;
++		};
++	};
++
++	/*
++	 * PM8994 GPIO 18 = DIVCLK4 = the 32.768 kHz sleep clock fed to the
++	 * QCA6174. The `divclk4` fixed-clock node declares pinctrl-0 =
++	 * <&divclk4_pin_a>, but `fixed-clock` is registered by
++	 * CLK_OF_DECLARE and clk-fixed-rate.c contains no pinctrl handling at
++	 * all, so that state is never applied and the pin keeps whatever
++	 * firmware left. This group is attached to wlan-vreg (a real platform
++	 * device) so that it actually gets programmed.
++	 */
++	wlan_clk_default: wlan-clk-state {
++		pinconf {
++			pins = "gpio18";
++			function = PMIC_GPIO_FUNC_FUNC2;
++			power-source = <PM8994_GPIO_S4>;
++			bias-disable;
++		};
++	};
++
+ 	bt_en_gpios: bt-en-gpios-state {
+ 		pinconf {
+ 			pins = "gpio19";
+@@ -509,10 +589,17 @@ pinconf {
+ 	};
+ 
+ 	divclk4_pin_a: divclk4-state {
++		/*
++		 * Vendor GPIO18 (DIVCLK4) config: FUNC2, VIN2, medium drive,
++		 * output enabled, so the PMIC divider really outputs the
++		 * 32.768 kHz sleep clock the QCA6174 (Wi-Fi and BT) need.
++		 */
+ 		pinconf {
+ 			pins = "gpio18";
+ 			function = PMIC_GPIO_FUNC_FUNC2;
+ 			power-source = <PM8994_GPIO_S4>;
++			qcom,drive-strength = <PMIC_GPIO_STRENGTH_MED>;
++			output-low;
+ 			bias-disable;
+ 		};
+ 	};
+@@ -604,6 +691,8 @@ vreg_s3a_1p3: s3 {
+ 			regulator-max-microvolt = <1300000>;
+ 			regulator-allow-set-load;
+ 			regulator-system-load = <300000>;
++			/* required by QCA6174a vdd-core */
++			regulator-always-on;
+ 		};
+ 
+ 		vreg_s4a_1p8: s4 {
+@@ -678,6 +767,7 @@ vreg_l8a_1p8: l8 {
+ 		vreg_l9a_1p8: l9 {
+ 			regulator-min-microvolt = <1800000>;
+ 			regulator-max-microvolt = <1800000>;
++
+ 		};
+ 
+ 		vreg_l10a_1p8: l10 {
+@@ -956,3 +1046,8 @@ hall_back_default: hall-back-default-state {
+ 		bias-disable;
+ 	};
+ };
++
++/* 3.10 vreg-1.8 is PM8994 L12. pciephy1 is 8994-only (cityman). */
++&pciephy0 {
++	vdda-supply = <&vreg_l12a_1p8>;
++};
+\ No newline at end of file
+diff --git a/arch/arm64/boot/dts/qcom/msm8994.dtsi b/arch/arm64/boot/dts/qcom/msm8994.dtsi
+index b509c0103..31c03ba25 100644
+--- a/arch/arm64/boot/dts/qcom/msm8994.dtsi
++++ b/arch/arm64/boot/dts/qcom/msm8994.dtsi
+@@ -674,8 +674,11 @@ blsp2_uart2: serial@f995e000 {
+ 			clock-names = "core", "iface";
+ 			clocks = <&gcc GCC_BLSP2_UART2_APPS_CLK>,
+ 					<&gcc GCC_BLSP2_AHB_CLK>;
+-			dmas = <&blsp2_dma 2>, <&blsp2_dma 3>;
+-			dma-names = "tx", "rx";
++			/*
++			 * The QCA6174 is held in reset while the BLSP2 DMA
++			 * channels are attached to this UART, so the dmas
++			 * properties are intentionally omitted.
++			 */
+ 			pinctrl-names = "default", "sleep";
+ 			pinctrl-0 = <&blsp2_uart2_default>;
+ 			pinctrl-1 = <&blsp2_uart2_sleep>;
+@@ -742,8 +745,179 @@ gcc: clock-controller@fc400000 {
+ 			#power-domain-cells = <1>;
+ 			reg = <0xfc400000 0x2000>;
+ 
+-			clock-names = "xo", "sleep";
+-			clocks = <&xo_board>, <&sleep_clk>;
++			clock-names = "xo", "sleep", "pcie_0_pipe", "pcie_1_pipe";
++			clocks = <&xo_board>, <&sleep_clk>, <&pciephy0>, <&pciephy1>;
++		};
++
++		pciephy0: phy@fc526000 {
++			compatible = "qcom,msm8994-qmp-pcie-phy";
++			reg = <0xfc526000 0x1000>;
++			clocks = <&rpmcc RPM_SMD_LN_BB_CLK>,
++				 <&gcc PCIE_0_PHY_LDO>,
++				 <&gcc GCC_PCIE_0_PIPE_CLK>;
++			clock-names = "ref", "ldo", "pipe";
++			resets = <&gcc PCIE_PHY_0_RESET>;
++			reset-names = "phy";
++			#clock-cells = <0>;
++			clock-output-names = "pcie_0_pipe";
++			#phy-cells = <0>;
++			status = "disabled";
++		};
++
++		pciephy1: phy@fc52e000 {
++			compatible = "qcom,msm8994-qmp-pcie-phy";
++			reg = <0xfc52e000 0x1000>;
++			clocks = <&rpmcc RPM_SMD_LN_BB_CLK>,
++				 <&gcc PCIE_1_PHY_LDO>,
++				 <&gcc GCC_PCIE_1_PIPE_CLK>;
++			clock-names = "ref", "ldo", "pipe";
++			resets = <&gcc PCIE_PHY_1_RESET>;
++			reset-names = "phy";
++			#clock-cells = <0>;
++			clock-output-names = "pcie_1_pipe";
++			#phy-cells = <0>;
++			status = "disabled";
++		};
++
++		pcie0: pcie@fc520000 {
++			compatible = "qcom,pcie-msm8994";
++			status = "disabled";
++			reg = <0xfc520000 0x2000>,
++			      <0xff000000 0xf1d>,
++			      <0xff000f20 0xa8>,
++			      <0xff100000 0x100000>;
++			reg-names = "parf", "dbi", "elbi", "config";
++			device_type = "pci";
++			linux,pci-domain = <0>;
++			bus-range = <0x00 0xff>;
++			num-lanes = <1>;
++			/*
++			 * 3.10 caps pcie_0_pipe_clk at 125 MHz, so this RC is
++			 * Gen1 only. Say so: otherwise the DWC advertises Gen2
++			 * in LNKCAP and pci_device_add() tries, and fails, to
++			 * retrain the link up to 5.0 GT/s before the
++			 * downstream bus is scanned.
++			 */
++			max-link-speed = <1>;
++			#address-cells = <3>;
++			#size-cells = <2>;
++			ranges = <0x01000000 0x0 0x0 0xff200000 0x0 0x100000>,
++				 <0x02000000 0x0 0xff300000 0xff300000 0x0 0xd00000>;
++			interrupts = <GIC_SPI 243 IRQ_TYPE_LEVEL_HIGH>;
++			interrupt-names = "msi";
++			#interrupt-cells = <1>;
++			interrupt-map-mask = <0 0 0 0x7>;
++			interrupt-map = <0 0 0 1 &intc GIC_SPI 244 IRQ_TYPE_LEVEL_HIGH>,
++					<0 0 0 2 &intc GIC_SPI 245 IRQ_TYPE_LEVEL_HIGH>,
++					<0 0 0 3 &intc GIC_SPI 247 IRQ_TYPE_LEVEL_HIGH>,
++					<0 0 0 4 &intc GIC_SPI 248 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&gcc GCC_PCIE_0_AUX_CLK>,
++				 <&gcc GCC_PCIE_0_CFG_AHB_CLK>,
++				 <&gcc GCC_PCIE_0_MSTR_AXI_CLK>,
++				 <&gcc GCC_PCIE_0_SLV_AXI_CLK>;
++			clock-names = "aux", "cfg", "bus_master", "bus_slave";
++			power-domains = <&gcc PCIE_0_GDSC>;
++			phys = <&pciephy0>;
++			phy-names = "pciephy";
++			qcom,scm-dev-id = <11>;
++
++			pcie@0 {
++				device_type = "pci";
++				reg = <0x0 0x0 0x0 0x0 0x0>;
++				bus-range = <0x01 0xff>;
++				#address-cells = <3>;
++				#size-cells = <2>;
++				ranges;
++			};
++		};
++
++		pcie1: pcie@fc528000 {
++			compatible = "qcom,pcie-msm8994";
++			status = "disabled";
++			reg = <0xfc528000 0x2000>,
++			      <0xf8800000 0xf1d>,
++			      <0xf8800f20 0xa8>,
++			      <0xf8801000 0x7f000>;
++			reg-names = "parf", "dbi", "elbi", "config";
++			device_type = "pci";
++			linux,pci-domain = <1>;
++			bus-range = <0x00 0xff>;
++			num-lanes = <1>;
++			/*
++			 * 3.10 caps pcie_1_pipe_clk at 125 MHz, so this RC is
++			 * Gen1 only. Say so: otherwise the DWC advertises Gen2
++			 * in LNKCAP and pci_device_add() tries, and fails, to
++			 * retrain the link up to 5.0 GT/s before the
++			 * downstream bus is scanned.
++			 */
++			max-link-speed = <1>;
++			#address-cells = <3>;
++			#size-cells = <2>;
++			ranges = <0x01000000 0x0 0x0 0xf8880000 0x0 0x80000>,
++				 <0x02000000 0x0 0xf8900000 0xf8900000 0x0 0x700000>;
++			interrupts = <GIC_SPI 271 IRQ_TYPE_LEVEL_HIGH>;
++			interrupt-names = "msi";
++			#interrupt-cells = <1>;
++			interrupt-map-mask = <0 0 0 0x7>;
++			interrupt-map = <0 0 0 1 &intc GIC_SPI 272 IRQ_TYPE_LEVEL_HIGH>,
++					<0 0 0 2 &intc GIC_SPI 273 IRQ_TYPE_LEVEL_HIGH>,
++					<0 0 0 3 &intc GIC_SPI 274 IRQ_TYPE_LEVEL_HIGH>,
++					<0 0 0 4 &intc GIC_SPI 275 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&gcc GCC_PCIE_1_AUX_CLK>,
++				 <&gcc GCC_PCIE_1_CFG_AHB_CLK>,
++				 <&gcc GCC_PCIE_1_MSTR_AXI_CLK>,
++				 <&gcc GCC_PCIE_1_SLV_AXI_CLK>;
++			clock-names = "aux", "cfg", "bus_master", "bus_slave";
++			power-domains = <&gcc PCIE_1_GDSC>;
++			/*
++			 * Do NOT add `interconnects` here. Attempted
++			 * 2026-09-13 (testNP): the vendor stack does vote
++			 * these paths (PEP lists ICBID_MASTER_PCIE_1,
++			 * ICBID_SLAVE_PCIE_1, ICBID_SLAVE_PCIE_1_CFG,
++			 * ICBID_SLAVE_PCIE_PARF; 3.10 votes
++			 * MSM_BUS_MASTER_PCIE_1 -> EBI_CH0 500/800 KBps),
++			 * and the ids to use are SNOC_MAS_PCIE_1 +
++			 * BIMC_SLV_EBI_CH0 ("pcie-mem") and
++			 * BIMC_MAS_AMPSS_M0 + CNOC_SLV_PCIE_1_CFG
++			 * ("cpu-pcie") - but wiring them makes the RC never
++			 * probe: the qnoc providers report
++			 * "sync_state() pending due to fc528000.pcie" while
++			 * the PCIe node defers on those same providers, so
++			 * fw_devlink holds it with no `driver` bound and
++			 * nothing in devices_deferred. Revisit only with a
++			 * fw_devlink=permissive style workaround, and only
++			 * once the endpoint actually enumerates - the vote
++			 * is needed for PCIe DMA, not for config access.
++			 *
++			 * 2026-09-16 (testR7): retried with fw_devlink=permissive
++			 * after the Cityman XL DSDT WlanD0ResourceVote confirmed
++			 * Windows DOES vote ICBID_MASTER_APPSS_PROC->
++			 * ICBID_SLAVE_PCIE_1_CFG. Result: it now HANGS (black
++			 * screen, USB up briefly then gone, camera-reboot dead) -
++			 * the WIP msm8994 icc driver can't handle the
++			 * BIMC->CNOC cross-provider path. And the link already
++			 * trains without it, so config TLPs are already issued:
++			 * this vote is bandwidth/DMA, not the enumeration gate.
++			 */
++			qcom,scm-dev-id = <12>;
++
++			/*
++			 * Endpoint properties belong on the port node, not the
++			 * Root Complex: qcom_pcie_parse_port() reads `phys` and
++			 * `reset-gpios` from here and qcom_pcie_parse_perst()
++			 * warns "Reusing PERST# from Root Complex node. DT needs
++			 * to be fixed!" if they sit on the host (Snaccy: pcie1
++			 * "has an endpoint property that it NEEDS downstream").
++			 */
++			pcie@0 {
++				device_type = "pci";
++				reg = <0x0 0x0 0x0 0x0 0x0>;
++				bus-range = <0x01 0xff>;
++				#address-cells = <3>;
++				#size-cells = <2>;
++				ranges;
++				phys = <&pciephy1>;
++			};
+ 		};
+ 
+ 		rpm_msg_ram: sram@fc428000 {
+@@ -1041,6 +1215,79 @@ sdc2_data_off: sdc2-data-off-state {
+ 				bias-pull-up;
+ 				drive-strength = <2>;
+ 			};
++
++			pcie0_default: pcie0-default-state {
++				perst-pins {
++					pins = "gpio53";
++					function = "gpio";
++					drive-strength = <2>;
++					bias-pull-down;
++				};
++
++				clkreq-pins {
++					pins = "gpio54";
++					function = "pci_e0";
++					drive-strength = <2>;
++					bias-pull-up;
++				};
++
++				wake-pins {
++					pins = "gpio55";
++					function = "gpio";
++					drive-strength = <2>;
++					bias-pull-down;
++				};
++			};
++
++			pcie1_default: pcie1-default-state {
++				perst-pins {
++					pins = "gpio35";
++					function = "gpio";
++					drive-strength = <2>;
++					bias-pull-down;
++				};
++
++				clkreq-pins {
++					pins = "gpio36";
++					function = "pci_e1";
++					drive-strength = <2>;
++					bias-pull-up;
++				};
++
++				wake-pins {
++					pins = "gpio37";
++					function = "gpio";
++					drive-strength = <2>;
++					bias-pull-down;
++				};
++			};
++
++			wlan_en_default: wlan-en-default-state {
++				pins = "gpio113";
++				function = "gpio";
++				drive-strength = <16>;
++				bias-pull-down;
++			};
++
++			/*
++			 * 3.10 CNSS `wlan-bootstrap-gpio` (TLMM 112). The
++			 * downstream 8994 boards carry it in msm8994-v2.dtsi:
++			 *   &cnss { wlan-bootstrap-gpio = <&msm_gpio 112 0>;
++			 *           pinctrl-0 = <&cnss_default &cnss_lpass_default>; }
++			 * and cnss_pci.c drives it high in
++			 * cnss_wlan_bootstrap_gpio_init() - with
++			 * WLAN_BOOTSTRAP_DELAY (10 ms) - *before* WLAN_EN
++			 * (TLMM 113) is raised and before msm_pcie_enumerate().
++			 * Pin 112 is only used by CNSS in the downstream tree
++			 * (`cnss_lpass`, drive-strength 16, pull-down).
++			 */
++			wlan_bootstrap_default: wlan-bootstrap-default-state {
++				pins = "gpio112";
++				function = "gpio";
++				drive-strength = <16>;
++				bias-pull-down;
++				output-high;
++			};
+ 		};
+ 
+ 		mmcc: clock-controller@fd8c0000 {
+diff --git a/drivers/clk/qcom/gcc-msm8994.c b/drivers/clk/qcom/gcc-msm8994.c
+index 6a6b7da2b..17f13af8f 100644
+--- a/drivers/clk/qcom/gcc-msm8994.c
++++ b/drivers/clk/qcom/gcc-msm8994.c
+@@ -27,6 +27,7 @@ enum {
+ 	P_XO,
+ 	P_GPLL0,
+ 	P_GPLL4,
++	P_PCIE_PIPE,
+ };
+ 
+ static struct clk_alpha_pll gpll0_early = {
+@@ -857,10 +858,22 @@ static const struct freq_tbl ftbl_pcie_0_aux_clk_src[] = {
+ 	{ }
+ };
+ 
++/*
++ * The PCIe aux RCGs are XO-only, so they used to carry no parent_map.
++ * clk_rcg2_determine_rate() -> _freq_tbl_determine_rate() feeds f->src
++ * to qcom_find_src_index(), which walks parent_map[] unconditionally, so
++ * a clk_set_rate() on the aux clock was a NULL-pointer dereference.
++ * Same shape as 8996 gcc_xo_sleep_clk_map (XO at mux 0).
++ */
++static const struct parent_map gcc_pcie_aux_map[] = {
++	{ P_XO, 0 },
++};
++
+ static struct clk_rcg2 pcie_0_aux_clk_src = {
+ 	.cmd_rcgr = 0x1b00,
+ 	.mnd_width = 8,
+ 	.hid_width = 5,
++	.parent_map = gcc_pcie_aux_map,
+ 	.freq_tbl = ftbl_pcie_0_aux_clk_src,
+ 	.clkr.hw.init = &(struct clk_init_data){
+ 		.name = "pcie_0_aux_clk_src",
+@@ -872,21 +885,36 @@ static struct clk_rcg2 pcie_0_aux_clk_src = {
+ 	},
+ };
+ 
++static const struct parent_map gcc_pcie_0_pipe_map[] = {
++	{ P_PCIE_PIPE, 2 },
++};
++
++static const struct clk_parent_data gcc_pcie_0_pipe[] = {
++	{ .fw_name = "pcie_0_pipe", .name = "pcie_0_pipe" },
++};
++
++static const struct parent_map gcc_pcie_1_pipe_map[] = {
++	{ P_PCIE_PIPE, 2 },
++};
++
++static const struct clk_parent_data gcc_pcie_1_pipe[] = {
++	{ .fw_name = "pcie_1_pipe", .name = "pcie_1_pipe" },
++};
++
+ static const struct freq_tbl ftbl_pcie_pipe_clk_src[] = {
+-	F(125000000, P_XO, 1, 0, 0),
++	F(125000000, P_PCIE_PIPE, 1, 0, 0),
+ 	{ }
+ };
+ 
+ static struct clk_rcg2 pcie_0_pipe_clk_src = {
+ 	.cmd_rcgr = 0x1adc,
+ 	.hid_width = 5,
++	.parent_map = gcc_pcie_0_pipe_map,
+ 	.freq_tbl = ftbl_pcie_pipe_clk_src,
+ 	.clkr.hw.init = &(struct clk_init_data){
+ 		.name = "pcie_0_pipe_clk_src",
+-		.parent_data = &(const struct clk_parent_data){
+-				.fw_name = "xo",
+-		},
+-		.num_parents = 1,
++		.parent_data = gcc_pcie_0_pipe,
++		.num_parents = ARRAY_SIZE(gcc_pcie_0_pipe),
+ 		.ops = &clk_rcg2_ops,
+ 	},
+ };
+@@ -900,6 +928,7 @@ static struct clk_rcg2 pcie_1_aux_clk_src = {
+ 	.cmd_rcgr = 0x1b80,
+ 	.mnd_width = 8,
+ 	.hid_width = 5,
++	.parent_map = gcc_pcie_aux_map,
+ 	.freq_tbl = ftbl_pcie_1_aux_clk_src,
+ 	.clkr.hw.init = &(struct clk_init_data){
+ 		.name = "pcie_1_aux_clk_src",
+@@ -914,13 +943,12 @@ static struct clk_rcg2 pcie_1_aux_clk_src = {
+ static struct clk_rcg2 pcie_1_pipe_clk_src = {
+ 	.cmd_rcgr = 0x1b5c,
+ 	.hid_width = 5,
++	.parent_map = gcc_pcie_1_pipe_map,
+ 	.freq_tbl = ftbl_pcie_pipe_clk_src,
+ 	.clkr.hw.init = &(struct clk_init_data){
+ 		.name = "pcie_1_pipe_clk_src",
+-		.parent_data = &(const struct clk_parent_data){
+-				.fw_name = "xo",
+-		},
+-		.num_parents = 1,
++		.parent_data = gcc_pcie_1_pipe,
++		.num_parents = ARRAY_SIZE(gcc_pcie_1_pipe),
+ 		.ops = &clk_rcg2_ops,
+ 	},
+ };
+@@ -1829,9 +1857,9 @@ static struct clk_branch gcc_pcie_1_aux_clk = {
+ };
+ 
+ static struct clk_branch gcc_pcie_1_cfg_ahb_clk = {
+-	.halt_reg = 0x1b54,
++	.halt_reg = 0x1b50,
+ 	.clkr = {
+-		.enable_reg = 0x1b54,
++		.enable_reg = 0x1b50,
+ 		.enable_mask = BIT(0),
+ 		.hw.init = &(struct clk_init_data){
+ 			.name = "gcc_pcie_1_cfg_ahb_clk",
+@@ -1841,9 +1869,9 @@ static struct clk_branch gcc_pcie_1_cfg_ahb_clk = {
+ };
+ 
+ static struct clk_branch gcc_pcie_1_mstr_axi_clk = {
+-	.halt_reg = 0x1b50,
++	.halt_reg = 0x1b4c,
+ 	.clkr = {
+-		.enable_reg = 0x1b50,
++		.enable_reg = 0x1b4c,
+ 		.enable_mask = BIT(0),
+ 		.hw.init = &(struct clk_init_data){
+ 			.name = "gcc_pcie_1_mstr_axi_clk",
+diff --git a/drivers/pci/controller/dwc/pcie-designware.c b/drivers/pci/controller/dwc/pcie-designware.c
+index 4d794964f..00d2c1afb 100644
+--- a/drivers/pci/controller/dwc/pcie-designware.c
++++ b/drivers/pci/controller/dwc/pcie-designware.c
+@@ -563,7 +563,7 @@ int dw_pcie_prog_outbound_atu(struct dw_pcie *pci,
+ 	if (upper_32_bits(limit_addr) > upper_32_bits(parent_bus_addr) &&
+ 	    dw_pcie_ver_is_ge(pci, 460A))
+ 		val |= PCIE_ATU_INCREASE_REGION_SIZE;
+-	if (dw_pcie_ver_is(pci, 490A))
++	if (dw_pcie_ver_is(pci, 490A) && !pci->no_ecrc)
+ 		val = dw_pcie_enable_ecrc(val);
+ 	dw_pcie_writel_atu_ob(pci, atu->index, PCIE_ATU_REGION_CTRL1, val);
+ 
+diff --git a/drivers/pci/controller/dwc/pcie-designware.h b/drivers/pci/controller/dwc/pcie-designware.h
+index ce9e18554..4e9a34449 100644
+--- a/drivers/pci/controller/dwc/pcie-designware.h
++++ b/drivers/pci/controller/dwc/pcie-designware.h
+@@ -510,6 +510,14 @@ struct dw_pcie {
+ 	u32			version;
+ 	u32			type;
+ 	unsigned long		caps;
++	/*
++	 * qcom msm8994: the ATU 'TD' bit is an ECRC override on cores older
++	 * than 5.10A, so dw_pcie_prog_outbound_atu() appends a TLP Digest to
++	 * every translated TLP. The vendor 3.10 stack never sets it
++	 * (msm_pcie_iatu_config() writes the transaction type only). Set from
++	 * the controller's "qcom,no-ecrc" DT property to match stock.
++	 */
++	bool			no_ecrc;
+ 	int			num_lanes;
+ 	int			max_link_speed;
+ 	u8			n_fts[2];
+diff --git a/drivers/pci/controller/dwc/pcie-qcom.c b/drivers/pci/controller/dwc/pcie-qcom.c
+index c789e3f85..82944a78a 100644
+--- a/drivers/pci/controller/dwc/pcie-qcom.c
++++ b/drivers/pci/controller/dwc/pcie-qcom.c
+@@ -12,6 +12,8 @@
+ #include <linux/crc8.h>
+ #include <linux/debugfs.h>
+ #include <linux/delay.h>
++#include <linux/workqueue.h>
++#include <linux/firmware/qcom/qcom_scm.h>
+ #include <linux/gpio/consumer.h>
+ #include <linux/interconnect.h>
+ #include <linux/interrupt.h>
+@@ -29,6 +31,7 @@
+ #include <linux/phy/phy.h>
+ #include <linux/regulator/consumer.h>
+ #include <linux/reset.h>
++#include <linux/pwrseq/consumer.h>
+ #include <linux/slab.h>
+ #include <linux/types.h>
+ #include <linux/units.h>
+@@ -242,6 +245,12 @@ struct qcom_pcie;
+ 
+ struct qcom_pcie_ops {
+ 	int (*get_resources)(struct qcom_pcie *pcie);
++	/*
++	 * Runs before PERST# is asserted. msm8994 uses this to power
++	 * vddpe-3v3 (i.e. bring the endpoint up before the RC asserts the
++	 * reset it needs released after the endpoint is powered).
++	 */
++	int (*pre_init)(struct qcom_pcie *pcie);
+ 	int (*init)(struct qcom_pcie *pcie);
+ 	int (*post_init)(struct qcom_pcie *pcie);
+ 	void (*host_post_init)(struct qcom_pcie *pcie);
+@@ -276,6 +285,11 @@ struct qcom_pcie {
+ 	struct dentry *debugfs;
+ 	bool suspended;
+ 	bool use_pm_opp;
++
++	/* msm8994: true while running the second, endpoint-powered bring-up */
++	bool second_pass;
++	/* msm8994: whether vddpe-3v3 is currently enabled */
++	bool rail_on;
+ };
+ 
+ #define to_qcom_pcie(x)		dev_get_drvdata((x)->dev)
+@@ -711,6 +725,317 @@ static int qcom_pcie_post_init_2_3_2(struct qcom_pcie *pcie)
+ 	return 0;
+ }
+ 
++/*
++ * msm8994: keep the endpoint-rail refcount and the actual regulator state in
++ * sync by hand, because pre_init/deinit are not paired the way
++ * qcom_pcie_init_2_3_2()/qcom_pcie_deinit_2_3_2() assume (pre_init is not run
++ * on the suspend/resume path's deinit).
++ */
++static int qcom_pcie_msm8994_rail(struct qcom_pcie *pcie, bool on)
++{
++	struct qcom_pcie_resources_2_3_2 *res = &pcie->res.v2_3_2;
++	int ret = 0;
++
++	if (on == pcie->rail_on)
++		return 0;
++
++	if (on)
++		ret = regulator_bulk_enable(ARRAY_SIZE(res->supplies),
++					    res->supplies);
++	else
++		regulator_bulk_disable(ARRAY_SIZE(res->supplies), res->supplies);
++	if (ret)
++		return ret;
++
++	pcie->rail_on = on;
++
++	return 0;
++}
++
++/*
++ * MSM8994: the endpoint is the QCA6174 on pcie1, powered by vddpe-3v3 (WLAN_EN).
++ *
++ * The endpoint needs a PERST# cycle while it is *unpowered*, then its power-up,
++ * then a second PERST# cycle - only then does it train a link. That was measured
++ * the hard way: powering the rail up front and running a single bring-up (the
++ * "obvious simplification") leaves the link untrained entirely ("Device not
++ * found", testOY), which is worse than the two-pass, and it is also why the
++ * vendor runs two enables (its first fails because nothing has powered the
++ * endpoint yet; cnss powers it and the second succeeds).
++ *
++ * So the first pass is deliberately left unpowered and simply fails, and
++ * ops->host_post_init redoes the bring-up with the rail on.
++ */
++static int qcom_pcie_pre_init_msm8994(struct qcom_pcie *pcie)
++{
++	/* vddpe-3v3 is left off for the first pass, see ops->host_post_init */
++	return 0;
++}
++
++static int qcom_pcie_get_resources_msm8994(struct qcom_pcie *pcie)
++{
++	struct qcom_pcie_resources_2_3_2 *res = &pcie->res.v2_3_2;
++	struct device *dev = pcie->pci->dev;
++	int ret;
++
++	res->supplies[0].supply = "vdda";
++	res->supplies[1].supply = "vddpe-3v3";
++	ret = devm_regulator_bulk_get(dev, ARRAY_SIZE(res->supplies),
++				      res->supplies);
++	if (ret)
++		return ret;
++
++	res->num_clks = devm_clk_bulk_get_all(dev, &res->clks);
++	if (res->num_clks < 0) {
++		dev_err(dev, "Failed to get clocks\n");
++		return res->num_clks;
++	}
++
++	return 0;
++}
++
++static void qcom_pcie_deinit_msm8994(struct qcom_pcie *pcie)
++{
++	struct qcom_pcie_resources_2_3_2 *res = &pcie->res.v2_3_2;
++	u32 val;
++
++	/* Force PHY to lowest power state */
++	val = readl(pcie->parf + PARF_PHY_CTRL);
++	val |= PHY_TEST_PWR_DOWN;
++	writel(val, pcie->parf + PARF_PHY_CTRL);
++
++	clk_bulk_disable_unprepare(res->num_clks, res->clks);
++
++	/* 2_3_2 would disable the rail unconditionally; ours is conditional */
++	qcom_pcie_msm8994_rail(pcie, false);
++}
++
++static int qcom_pcie_init_msm8994(struct qcom_pcie *pcie)
++{
++	struct qcom_pcie_resources_2_3_2 *res = &pcie->res.v2_3_2;
++	struct device *dev = pcie->pci->dev;
++	u32 scm_dev_id, val;
++	int i, ret;
++
++	/*
++	 * The second pass powers the endpoint here, i.e. while PERST# is still
++	 * asserted and before it is released. The first pass leaves the rail off
++	 * on purpose: that unpowered PERST# cycle is what the endpoint needs
++	 * before it will train (see qcom_pcie_pre_init_msm8994()).
++	 *
++	 * 3.10 sets aux to 1.011 MHz before clk_prepare_enable.
++	 */
++	if (pcie->second_pass) {
++		/*
++		 * Power the endpoint 3.3V rail (vddpe-3v3) while PERST# is still
++		 * asserted. The VDDIO rails (PM8994 s4/l30, 1.8V) are always-on in
++		 * DT and therefore already up, so the endpoint sees its required
++		 * power-up order: I/O (VDDIO) rails first, 3.3V rails last.
++		 */
++		usleep_range(2000, 2500);	/* VDDIO (1.8V) settled */
++
++		ret = qcom_pcie_msm8994_rail(pcie, true);
++		if (ret) {
++			dev_err(dev, "cannot enable the endpoint rail\n");
++			return ret;
++		}
++		/*
++		 * power valid -> WLAN_EN (>= Tpwlen) and power valid ->
++		 * PCIE_RST_L assert (>= Tprst) are already satisfied, and REFCLK
++		 * has been stable for well over Tclkrst before PERST# is released
++		 * by the caller.
++		 */
++		usleep_range(2000, 2500);
++	}
++
++	for (i = 0; i < res->num_clks; i++) {
++		if (res->clks[i].id && !strcmp(res->clks[i].id, "aux")) {
++			ret = clk_set_rate(res->clks[i].clk, 1011000);
++			if (ret) {
++				dev_err(dev, "cannot set aux rate\n");
++				goto err_disable_regulators;
++			}
++			break;
++		}
++	}
++
++	ret = clk_bulk_prepare_enable(res->num_clks, res->clks);
++	if (ret) {
++		dev_err(dev, "cannot prepare/enable clocks\n");
++		goto err_disable_regulators;
++	}
++
++	/* 3.10 pci-msm.c restores TZ sec cfg (scm-dev-id) before PARF. */
++	if (!of_property_read_u32(dev->of_node, "qcom,scm-dev-id",
++				  &scm_dev_id) &&
++	    qcom_scm_restore_sec_cfg_available()) {
++		ret = qcom_scm_restore_sec_cfg(scm_dev_id, 0);
++		if (ret) {
++			dev_err_probe(dev, ret, "restore sec cfg %u\n",
++				      scm_dev_id);
++			goto err_disable_clks;
++		}
++	}
++
++	/* 3.10 PARF: PHY_CTRL bit0 clear, DBI base 0, SYS_CTRL 0x365E. */
++	val = readl(pcie->parf + PARF_PHY_CTRL);
++	val &= ~PHY_TEST_PWR_DOWN;
++	writel(val, pcie->parf + PARF_PHY_CTRL);
++
++	writel(0, pcie->parf + PARF_DBI_BASE_ADDR);
++	writel(0x365e, pcie->parf + PARF_SYS_CTRL);
++
++	/*
++	 * Toggle this RC's block reset (GCC_PCIE_n_BCR) before the PHY is
++	 * brought up. The Cityman ACPI firmware (PCON._RST) does this as part
++	 * of its PCIe/WLAN power-up; without it the endpoint never answers
++	 * config space (the PHY trains the link but the config responder stays
++	 * silent). RC0 (MSM8992 Talkman WLAN) is at 0x1ac0, RC1 at 0x1b40.
++	 */
++	{
++		void __iomem *gcc = ioremap(0xfc400000, 0x3000);
++		u32 domain = 1, bcr;
++
++		of_property_read_u32(dev->of_node, "linux,pci-domain", &domain);
++		bcr = domain ? 0x1b40 : 0x1ac0;
++		if (gcc) {
++			writel(1, gcc + bcr);
++			usleep_range(2000, 2500);
++			writel(0, gcc + bcr);
++			iounmap(gcc);
++		}
++	}
++
++	return 0;
++
++err_disable_clks:
++	clk_bulk_disable_unprepare(res->num_clks, res->clks);
++err_disable_regulators:
++	qcom_pcie_msm8994_rail(pcie, false);
++
++	return ret;
++}
++
++static int qcom_pcie_post_init_msm8994(struct qcom_pcie *pcie)
++{
++	/*
++	 * The endpoint needs time to finish its internal power-up while PERST#
++	 * is still asserted, before the link is brought up.
++	 */
++	usleep_range(200000, 205000);
++
++	return 0;
++}
++
++static int qcom_pcie_host_init(struct dw_pcie_rp *pp);
++static void qcom_pcie_host_deinit(struct dw_pcie_rp *pp);
++
++/*
++ * Second pass, reproducing the vendor's two-enable shape on msm8994.
++ *
++ * msm_pcie_enable() runs once during boot before anything powers the QCA6174
++ * and fails ("link initialization failed"); cnss_wlan_get_resources() then
++ * powers WLAN_EN and the second msm_pcie_enable() redoes assert-PERST# ->
++ * clocks/PARF/PHY -> release-PERST# with the endpoint already powered, which is
++ * what makes 168c:003e answer config space.
++ *
++ * This runs from qcom_pcie_host_post_init(), i.e. after dw_pcie_host_init()
++ * has already run the first link attempt and pci_host_probe(), so the failed
++ * state is observable here and the scanned-but-empty bus 1 can be rescanned.
++ *
++ * A PERST# pulse here is only safe because the first pass really did fail to
++ * train a link (vddpe-3v3 was never enabled): re-pulsing PERST# on a live link
++ * resets QCA9xxx silicon on this unit (see notes/wifi-octagon.md).
++ */
++/*
++ * 3.10 msm_pcie_config_controller()'s two error-reporting *enables*, applied
++ * once the link is up and the bus has been scanned - the point where 3.10 runs
++ * them inline in msm_pcie_enable(). msm_pcie_write_mask(reg, 0, val) ORs val
++ * in, so both are enables:
++ *
++ *   PCIE20_ACK_F_ASPM_CTRL_REG (0x70C) BIT(15)  - no qcom,n-fts
++ *   PCIE20_CAP_DEVCTRLSTATUS   (0x78)  BIT(3..0) - CERE|NFERE|FERE|URRE
++ *
++ * The third 3.10 write there, PCIE20_BRIDGE_CTRL (0x3C) BIT(16|17), is Bridge
++ * Control Parity Error Response Enable + **SERR# Enable**; enabling SERR# on a
++ * mainline ARM kernel with no SERR# handler escalates any downstream error to
++ * SError and resets this SoC (measured, testOO), so it is deliberately omitted.
++ *
++ * DevCtl reporting matters: with it clear an Unsupported-Request completion is
++ * silently discarded, which is exactly the signature before this change
++ * (rv=0, all-1s data, no AER record).
++ */
++static void qcom_pcie_host_post_msm8994(struct qcom_pcie *pcie)
++{
++	struct dw_pcie *pci = pcie->pci;
++	struct dw_pcie_rp *pp = &pci->pp;
++	u32 val;
++	int ret;
++
++	/*
++	 * Second pass. The probe-time attempt ran with the endpoint unpowered and
++	 * therefore did not train a link; that unpowered PERST# cycle is required
++	 * (see qcom_pcie_pre_init_msm8994()). Power the rail and redo the whole
++	 * bring-up, then rescan the bus that pass 1 left empty.
++	 *
++	 * Re-pulsing PERST# here is only safe because pass 1 genuinely failed to
++	 * train: a PERST# pulse on a live link resets QCA9xxx silicon on this unit.
++	 */
++	if (!dw_pcie_link_up(pci)) {
++		dev_info(pci->dev, "first pass trained no link, redoing it powered\n");
++
++		qcom_pcie_host_deinit(pp);
++
++		/*
++		 * Power-cycle the endpoint rail so it sees a fresh reset edge,
++		 * as the vendor's disable/enable pair does.
++		 */
++		qcom_pcie_msm8994_rail(pcie, false);
++		usleep_range(20000, 21000);
++
++		pcie->second_pass = true;
++
++		ret = qcom_pcie_host_init(pp);
++		if (ret) {
++			dev_err(pci->dev, "second bring-up failed (%d)\n", ret);
++			return;
++		}
++
++		ret = dw_pcie_setup_rc(pp);
++		if (ret) {
++			dev_err(pci->dev, "setup_rc failed (%d)\n", ret);
++			return;
++		}
++
++		qcom_pcie_start_link(pci);
++
++		ret = dw_pcie_wait_for_link(pci);
++		if (ret) {
++			dev_err(pci->dev, "endpoint did not answer (%d)\n", ret);
++			return;
++		}
++
++		pci_rescan_bus(pp->bridge->bus);
++	}
++
++	/*
++	 * Enable the RC's two error-reporting paths once the link is up and the
++	 * bus has been scanned:
++	 *   PCIE20_ACK_F_ASPM_CTRL_REG (0x70c) BIT(15) - no N_FTS
++	 *   PCIE20_CAP_DEVCTRLSTATUS   (0x78)  BIT(3..0) - CERE|NFERE|FERE|URRE
++	 * With DevCtl error reporting clear an Unsupported-Request completion is
++	 * silently discarded (rv=0, all-1s data, no AER record).
++	 */
++	val = readl(pci->dbi_base + 0x70c);
++	val |= BIT(15);
++	writel(val, pci->dbi_base + 0x70c);
++
++	val = readl(pci->dbi_base + 0x78);
++	val |= BIT(3) | BIT(2) | BIT(1) | BIT(0);
++	writel(val, pci->dbi_base + 0x78);
++}
++
++
+ static int qcom_pcie_get_resources_2_4_0(struct qcom_pcie *pcie)
+ {
+ 	struct qcom_pcie_resources_2_4_0 *res = &pcie->res.v2_4_0;
+@@ -1229,12 +1554,34 @@ static bool qcom_pcie_link_up(struct dw_pcie *pci)
+ 	return val & PCI_EXP_LNKSTA_DLLLA;
+ }
+ 
++/*
++ * LAB: delay between PERST# deassert (link up) and the first config scan.
++ * The working vendor leaves ~600 ms after releasing PERST before it first
++ * reads the EP (which then answers immediately); mainline scans at once. If
++ * the QCA6174 needs settle/CRS time after link-up this closes it.
++ * Set via cmdline: qcom_pcie.ep_settle_ms=NNN  (default 0 = unchanged).
++ */
++static unsigned int ep_settle_ms;
++module_param(ep_settle_ms, uint, 0644);
++MODULE_PARM_DESC(ep_settle_ms, "ms to wait after PERST# deassert before config scan");
++
+ static int qcom_pcie_host_init(struct dw_pcie_rp *pp)
+ {
+ 	struct dw_pcie *pci = to_dw_pcie_from_pp(pp);
+ 	struct qcom_pcie *pcie = to_qcom_pcie(pci);
+ 	int ret;
+ 
++	/*
++	 * msm8994: power the endpoint rail before the RC asserts PERST#, so the
++	 * QCA6174 is up when the reset is released (3.10 cnss powers WLAN_EN
++	 * before msm_pcie_enumerate()).
++	 */
++	if (pcie->cfg->ops->pre_init) {
++		ret = pcie->cfg->ops->pre_init(pcie);
++		if (ret)
++			return ret;
++	}
++
+ 	qcom_ep_reset_assert(pcie);
+ 
+ 	ret = pcie->cfg->ops->init(pcie);
+@@ -1277,6 +1624,9 @@ static int qcom_pcie_host_init(struct dw_pcie_rp *pp)
+ 
+ static void qcom_pcie_host_deinit(struct dw_pcie_rp *pp)
+ {
++	if (ep_settle_ms)
++		msleep(ep_settle_ms);
++
+ 	struct dw_pcie *pci = to_dw_pcie_from_pp(pp);
+ 	struct qcom_pcie *pcie = to_qcom_pcie(pci);
+ 
+@@ -1327,6 +1677,17 @@ static const struct qcom_pcie_ops ops_2_3_2 = {
+ 	.ltssm_enable = qcom_pcie_2_3_2_ltssm_enable,
+ };
+ 
++/* MSM8994: 2.3.2 PARF, endpoint rail powered on the second bring-up pass */
++static const struct qcom_pcie_ops ops_msm8994 = {
++	.get_resources = qcom_pcie_get_resources_msm8994,
++	.pre_init = qcom_pcie_pre_init_msm8994,
++	.init = qcom_pcie_init_msm8994,
++	.post_init = qcom_pcie_post_init_msm8994,
++	.deinit = qcom_pcie_deinit_msm8994,
++	.ltssm_enable = qcom_pcie_2_3_2_ltssm_enable,
++	.host_post_init = qcom_pcie_host_post_msm8994,
++};
++
+ /* Qcom IP rev.: 2.4.0	Synopsys IP rev.: 4.20a */
+ static const struct qcom_pcie_ops ops_2_4_0 = {
+ 	.get_resources = qcom_pcie_get_resources_2_4_0,
+@@ -1405,6 +1766,10 @@ static const struct qcom_pcie_cfg cfg_2_3_2 = {
+ 	.ops = &ops_2_3_2,
+ };
+ 
++static const struct qcom_pcie_cfg cfg_msm8994 = {
++	.ops = &ops_msm8994,
++};
++
+ static const struct qcom_pcie_cfg cfg_2_3_3 = {
+ 	.ops = &ops_2_3_3,
+ };
+@@ -1613,6 +1978,17 @@ static int qcom_pcie_probe(struct platform_device *pdev)
+ 
+ 	pci->dev = dev;
+ 	pci->ops = &dw_pcie_ops;
++	/*
++	 * The DWC ATU 'TD' bit in outbound Control Register 1 is an override for
++	 * the TLP Digest (ECRC) setting: for cores older than 5.10A the core
++	 * appends a TLP Digest to *every* TLP whose address is translated by the
++	 * ATU. The vendor 3.10 stack never sets it (msm_pcie_iatu_config() writes
++	 * only the transaction type, PCIE20_CTRL1_TYPE_CFG0 = 0x4), so we are
++	 * forcing a TLP Digest onto the QCA6174 that stock firmware never sees.
++	 * Let the DT turn that override off.
++	 */
++	pci->no_ecrc = of_property_read_bool(dev->of_node, "qcom,no-ecrc");
++
+ 	pp = &pci->pp;
+ 
+ 	pcie->pci = pci;
+@@ -1847,6 +2223,7 @@ static const struct of_device_id qcom_pcie_match[] = {
+ 	{ .compatible = "qcom,pcie-ipq8074", .data = &cfg_2_3_3 },
+ 	{ .compatible = "qcom,pcie-ipq8074-gen3", .data = &cfg_2_9_0 },
+ 	{ .compatible = "qcom,pcie-ipq9574", .data = &cfg_2_9_0 },
++	{ .compatible = "qcom,pcie-msm8994", .data = &cfg_msm8994 },
+ 	{ .compatible = "qcom,pcie-msm8996", .data = &cfg_2_3_2 },
+ 	{ .compatible = "qcom,pcie-qcs404", .data = &cfg_2_4_0 },
+ 	{ .compatible = "qcom,pcie-sa8540p", .data = &cfg_sc8280xp },
+diff --git a/drivers/phy/qualcomm/Kconfig b/drivers/phy/qualcomm/Kconfig
+index ef14f4e33..fd1a5ff5e 100644
+--- a/drivers/phy/qualcomm/Kconfig
++++ b/drivers/phy/qualcomm/Kconfig
+@@ -77,6 +77,15 @@ config PHY_QCOM_QMP_PCIE
+ 	  Enable this to support the QMP PCIe PHY transceiver that is used
+ 	  with PCIe controllers on Qualcomm chips.
+ 
++config PHY_QCOM_QMP_PCIE_8994
++	tristate "Qualcomm QMP PCIe 8994 PHY Driver"
++	depends on PCI || COMPILE_TEST
++	select GENERIC_PHY
++	default PHY_QCOM_QMP
++	help
++	  Enable this to support the per-port 20nm QMP PCIe PHY on
++	  Qualcomm MSM8994 / MSM8992.
++
+ config PHY_QCOM_QMP_PCIE_8996
+ 	tristate "Qualcomm QMP PCIe 8996 PHY Driver"
+ 	depends on PCI || COMPILE_TEST
+diff --git a/drivers/phy/qualcomm/Makefile b/drivers/phy/qualcomm/Makefile
+index 3851e28a2..8e50c73f0 100644
+--- a/drivers/phy/qualcomm/Makefile
++++ b/drivers/phy/qualcomm/Makefile
+@@ -11,6 +11,7 @@ obj-$(CONFIG_PHY_QCOM_QMP_COMBO)	+= phy-qcom-qmp-combo.o phy-qcom-qmp-usbc.o
+ obj-$(CONFIG_PHY_QCOM_QMP_PCIE)		+= phy-qcom-qmp-pcie.o
+ obj-$(CONFIG_PHY_QCOM_QMP_PCIE_8996)	+= phy-qcom-qmp-pcie-msm8996.o
+ obj-$(CONFIG_PHY_QCOM_QMP_UFS)		+= phy-qcom-qmp-ufs.o
++obj-$(CONFIG_PHY_QCOM_QMP_PCIE_8994)	+= phy-qcom-qmp-pcie-msm8994.o
+ obj-$(CONFIG_PHY_QCOM_QMP_USB)		+= phy-qcom-qmp-usb.o
+ obj-$(CONFIG_PHY_QCOM_QMP_USB_LEGACY)	+= phy-qcom-qmp-usb-legacy.o
+ 
+diff --git a/drivers/phy/qualcomm/phy-qcom-qmp-pcie-msm8994.c b/drivers/phy/qualcomm/phy-qcom-qmp-pcie-msm8994.c
+new file mode 100644
+index 000000000..6b1bba77b
+--- /dev/null
++++ b/drivers/phy/qualcomm/phy-qcom-qmp-pcie-msm8994.c
+@@ -0,0 +1,348 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Qualcomm MSM8994 20nm QMP PCIe PHY
++ *
++ * Sequence is the 3.10 20nm QMP / 19.2 MHz table in pci-msm.c
++ * (non-FSM9010, non-vbg-opt). One 4 KiB block per RC.
++ */
++
++#include <linux/clk.h>
++#include <linux/clk-provider.h>
++#include <linux/delay.h>
++#include <linux/io.h>
++#include <linux/iopoll.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/phy/phy.h>
++#include <linux/platform_device.h>
++#include <linux/regulator/consumer.h>
++#include <linux/reset.h>
++
++#define QSERDES_COM_PLL_VCOTAIL_EN		0x004
++#define QSERDES_COM_IE_TRIM			0x00c
++#define QSERDES_COM_IP_TRIM			0x010
++#define QSERDES_COM_PLL_CNTRL			0x014
++#define QSERDES_COM_PLL_IP_SETI			0x024
++#define QSERDES_COM_PLL_CP_SETI			0x034
++#define QSERDES_COM_PLL_IP_SETP			0x038
++#define QSERDES_COM_PLL_CP_SETP			0x03c
++#define QSERDES_COM_SYSCLK_EN_SEL_TXBAND	0x048
++#define QSERDES_COM_RESETSM_CNTRL		0x04c
++#define QSERDES_COM_RESETSM_CNTRL2		0x050
++#define QSERDES_COM_PLLLOCK_CMP1		0x090
++#define QSERDES_COM_PLLLOCK_CMP2		0x094
++#define QSERDES_COM_PLLLOCK_CMP_EN		0x09c
++#define QSERDES_COM_DEC_START1			0x0ac
++#define QSERDES_COM_RES_CODE_START_SEG1		0x0e0
++#define QSERDES_COM_RES_CODE_CAL_CSR		0x0e8
++#define QSERDES_COM_RES_TRIM_CONTROL		0x0f0
++#define QSERDES_COM_DIV_FRAC_START1		0x100
++#define QSERDES_COM_DIV_FRAC_START2		0x104
++#define QSERDES_COM_DIV_FRAC_START3		0x108
++#define QSERDES_COM_DEC_START2			0x10c
++#define QSERDES_COM_PLL_RXTXEPCLK_EN		0x110
++#define QSERDES_COM_PLL_CRCTRL			0x114
++
++#define QSERDES_TX_RCV_DETECT_LVL		0x268
++
++#define QSERDES_RX_CDR_CONTROL1			0x400
++#define QSERDES_RX_CDR_CONTROL_HALF		0x408
++#define QSERDES_RX_UCDR_FO_GAIN			0x414
++#define QSERDES_RX_UCDR_SO_GAIN			0x418
++#define QSERDES_RX_UCDR_SO_SATURATION_AND_ENABLE 0x41c
++#define QSERDES_RX_RX_EQ_GAIN1_LSB		0x4a8
++#define QSERDES_RX_RX_EQ_GAIN1_MSB		0x4ac
++#define QSERDES_RX_RX_EQ_GAIN2_LSB		0x4b0
++#define QSERDES_RX_RX_EQ_GAIN2_MSB		0x4b4
++#define QSERDES_RX_RX_EQU_ADAPTOR_CNTRL2	0x4bc
++#define QSERDES_RX_RX_EQ_OFFSET_ADAPTOR_CNTRL1	0x4f0
++#define QSERDES_RX_RX_OFFSET_ADAPTOR_CNTRL2	0x4f4
++#define QSERDES_RX_SIGDET_ENABLES		0x4f8
++#define QSERDES_RX_SIGDET_CNTRL			0x500
++#define QSERDES_RX_SIGDET_DEGLITCH_CNTRL	0x504
++
++#define PCIE_PHY_SW_RESET			0x600
++#define PCIE_PHY_POWER_DOWN_CONTROL		0x604
++#define PCIE_PHY_START				0x608
++#define PCIE_PHY_ENDPOINT_REFCLK_DRIVE		0x648
++#define PCIE_PHY_RX_IDLE_DTCT_CNTRL		0x64c
++#define PCIE_PHY_POWER_STATE_CONFIG1		0x650
++#define PCIE_PHY_POWER_STATE_CONFIG2		0x654
++#define PCIE_PHY_PCS_STATUS			0x728
++
++#define PHY_READY				BIT(6)
++#define PHY_INIT_TIMEOUT_US			10000
++
++struct qmp_pcie_msm8994 {
++	struct device *dev;
++	void __iomem *base;
++	struct clk *ref;
++	struct clk *ldo;
++	struct clk *pipe;
++	struct reset_control *reset;
++	struct regulator *vdda;
++};
++
++static void qmp_write(struct qmp_pcie_msm8994 *qmp, u32 off, u32 val)
++{
++	writel(val, qmp->base + off);
++}
++
++static int qmp_pcie_msm8994_power_on(struct phy *phy)
++{
++	struct qmp_pcie_msm8994 *qmp = phy_get_drvdata(phy);
++	u32 val;
++	int ret;
++
++	/* 3.10 clk_init: LDO + PHY BCR deassert with the non-pipe clocks */
++	ret = clk_prepare_enable(qmp->ldo);
++	if (ret)
++		return ret;
++
++	ret = reset_control_deassert(qmp->reset);
++	if (ret) {
++		clk_disable_unprepare(qmp->ldo);
++		return ret;
++	}
++
++	/*
++	 * Do NOT replace this with a blanket copy of the vendor
++	 * pcie20_phy_init_default() table: that was tried (testOW) and the PHY
++	 * then fails to become ready on the second bring-up
++	 * ("PHY not ready (pcs 0x68)" / "phy poweron failed --> -110"), which
++	 * aborts the whole second pass - presumably because the second pass
++	 * re-initialises an already-initialised PHY and the vendor PLL/RX values
++	 * are not safe to apply twice. This sequence brings the PHY ready
++	 * reliably on both passes and its end state matches the working vendor
++	 * part register-for-register (verified, see notes/wifi-octagon.md).
++	 */
++	qmp_write(qmp, PCIE_PHY_POWER_DOWN_CONTROL, 0x03);
++	qmp_write(qmp, QSERDES_COM_SYSCLK_EN_SEL_TXBAND, 0x08);
++	qmp_write(qmp, QSERDES_COM_DEC_START1, 0x82);
++	qmp_write(qmp, QSERDES_COM_DEC_START2, 0x03);
++	qmp_write(qmp, QSERDES_COM_DIV_FRAC_START1, 0xd5);
++	qmp_write(qmp, QSERDES_COM_DIV_FRAC_START2, 0xaa);
++	qmp_write(qmp, QSERDES_COM_DIV_FRAC_START3, 0x4d);
++	qmp_write(qmp, QSERDES_COM_PLLLOCK_CMP_EN, 0x03);
++	qmp_write(qmp, QSERDES_COM_PLLLOCK_CMP1, 0x06);
++	qmp_write(qmp, QSERDES_COM_PLLLOCK_CMP2, 0x1a);
++	qmp_write(qmp, QSERDES_COM_PLL_CRCTRL, 0x7c);
++	qmp_write(qmp, QSERDES_COM_PLL_CP_SETI, 0x1f);
++	qmp_write(qmp, QSERDES_COM_PLL_IP_SETP, 0x12);
++	qmp_write(qmp, QSERDES_COM_PLL_CP_SETP, 0x0f);
++	qmp_write(qmp, QSERDES_COM_PLL_IP_SETI, 0x01);
++	qmp_write(qmp, QSERDES_COM_IE_TRIM, 0x0f);
++	qmp_write(qmp, QSERDES_COM_IP_TRIM, 0x0f);
++	qmp_write(qmp, QSERDES_COM_PLL_CNTRL, 0x46);
++	qmp_write(qmp, QSERDES_RX_CDR_CONTROL1, 0xf4);
++	qmp_write(qmp, QSERDES_RX_CDR_CONTROL_HALF, 0x2c);
++	qmp_write(qmp, QSERDES_COM_PLL_VCOTAIL_EN, 0xe1);
++	qmp_write(qmp, QSERDES_COM_RESETSM_CNTRL, 0x91);
++	qmp_write(qmp, QSERDES_COM_RESETSM_CNTRL2, 0x07);
++	qmp_write(qmp, QSERDES_COM_RES_CODE_START_SEG1, 0x20);
++	qmp_write(qmp, QSERDES_COM_RES_CODE_CAL_CSR, 0x77);
++	qmp_write(qmp, QSERDES_COM_RES_TRIM_CONTROL, 0x15);
++	qmp_write(qmp, QSERDES_TX_RCV_DETECT_LVL, 0x03);
++	qmp_write(qmp, QSERDES_RX_UCDR_FO_GAIN, 0x09);
++	qmp_write(qmp, QSERDES_RX_UCDR_SO_GAIN, 0x04);
++	qmp_write(qmp, QSERDES_RX_UCDR_SO_SATURATION_AND_ENABLE, 0x49);
++	qmp_write(qmp, QSERDES_RX_RX_EQ_GAIN1_LSB, 0xff);
++	qmp_write(qmp, QSERDES_RX_RX_EQ_GAIN1_MSB, 0x1f);
++	qmp_write(qmp, QSERDES_RX_RX_EQ_GAIN2_LSB, 0xff);
++	qmp_write(qmp, QSERDES_RX_RX_EQ_GAIN2_MSB, 0x00);
++	qmp_write(qmp, QSERDES_RX_RX_EQU_ADAPTOR_CNTRL2, 0x1e);
++	qmp_write(qmp, QSERDES_RX_RX_EQ_OFFSET_ADAPTOR_CNTRL1, 0x67);
++	qmp_write(qmp, QSERDES_RX_RX_OFFSET_ADAPTOR_CNTRL2, 0x80);
++	qmp_write(qmp, QSERDES_RX_SIGDET_ENABLES, 0x40);
++	qmp_write(qmp, QSERDES_RX_SIGDET_CNTRL, 0xb0);
++	qmp_write(qmp, QSERDES_RX_SIGDET_DEGLITCH_CNTRL, 0x06);
++	qmp_write(qmp, QSERDES_COM_PLL_RXTXEPCLK_EN, 0x10);
++	qmp_write(qmp, PCIE_PHY_ENDPOINT_REFCLK_DRIVE, 0x10);
++	qmp_write(qmp, PCIE_PHY_POWER_STATE_CONFIG1, 0xa3);
++	qmp_write(qmp, PCIE_PHY_POWER_STATE_CONFIG2, 0x4b);
++	qmp_write(qmp, PCIE_PHY_RX_IDLE_DTCT_CNTRL, 0x4d);
++	qmp_write(qmp, PCIE_PHY_SW_RESET, 0x00);
++	qmp_write(qmp, PCIE_PHY_START, 0x03);
++
++	usleep_range(995, 1005);
++
++	/* 3.10 msm_pcie_pipe_clk_init: set_rate 125 MHz selects pipe mux 2 */
++	ret = clk_set_rate(qmp->pipe, 125000000);
++	if (ret)
++		goto err_reset;
++
++	ret = clk_prepare_enable(qmp->pipe);
++	if (ret)
++		goto err_reset;
++
++	ret = readl_poll_timeout(qmp->base + PCIE_PHY_PCS_STATUS, val,
++				 !(val & PHY_READY), 200, PHY_INIT_TIMEOUT_US);
++	if (ret) {
++		dev_err(qmp->dev, "PHY not ready (pcs 0x%x)\n", val);
++		clk_disable_unprepare(qmp->pipe);
++		goto err_reset;
++	}
++
++	return 0;
++
++err_reset:
++	reset_control_assert(qmp->reset);
++	clk_disable_unprepare(qmp->ldo);
++	return ret;
++}
++
++static int qmp_pcie_msm8994_power_off(struct phy *phy)
++{
++	struct qmp_pcie_msm8994 *qmp = phy_get_drvdata(phy);
++
++	qmp_write(qmp, PCIE_PHY_SW_RESET, 0x01);
++	qmp_write(qmp, PCIE_PHY_START, 0x00);
++	qmp_write(qmp, PCIE_PHY_POWER_DOWN_CONTROL, 0x00);
++	clk_disable_unprepare(qmp->pipe);
++	reset_control_assert(qmp->reset);
++	clk_disable_unprepare(qmp->ldo);
++
++	return 0;
++}
++
++static int qmp_pcie_msm8994_init(struct phy *phy)
++{
++	struct qmp_pcie_msm8994 *qmp = phy_get_drvdata(phy);
++	int ret;
++
++	/* 3.10 vreg-1.8 (L12) + ln_bb; LDO/BCR wait for RC clocks */
++	ret = regulator_enable(qmp->vdda);
++	if (ret)
++		return ret;
++
++	ret = clk_prepare_enable(qmp->ref);
++	if (ret) {
++		regulator_disable(qmp->vdda);
++		return ret;
++	}
++
++	return 0;
++}
++
++static int qmp_pcie_msm8994_exit(struct phy *phy)
++{
++	struct qmp_pcie_msm8994 *qmp = phy_get_drvdata(phy);
++
++	clk_disable_unprepare(qmp->ref);
++	regulator_disable(qmp->vdda);
++	return 0;
++}
++
++static const struct phy_ops qmp_pcie_msm8994_ops = {
++	.init		= qmp_pcie_msm8994_init,
++	.exit		= qmp_pcie_msm8994_exit,
++	.power_on	= qmp_pcie_msm8994_power_on,
++	.power_off	= qmp_pcie_msm8994_power_off,
++	.owner		= THIS_MODULE,
++};
++
++static void phy_clk_release_provider(void *np)
++{
++	of_clk_del_provider(np);
++}
++
++static int qmp_pcie_msm8994_register_pipe(struct qmp_pcie_msm8994 *qmp)
++{
++	struct clk_fixed_rate *fixed;
++	struct clk_init_data init = { };
++	int ret;
++
++	ret = of_property_read_string(qmp->dev->of_node, "clock-output-names",
++				      &init.name);
++	if (ret)
++		return ret;
++
++	fixed = devm_kzalloc(qmp->dev, sizeof(*fixed), GFP_KERNEL);
++	if (!fixed)
++		return -ENOMEM;
++
++	init.ops = &clk_fixed_rate_ops;
++	fixed->fixed_rate = 125000000;
++	fixed->hw.init = &init;
++
++	ret = devm_clk_hw_register(qmp->dev, &fixed->hw);
++	if (ret)
++		return ret;
++
++	ret = of_clk_add_hw_provider(qmp->dev->of_node, of_clk_hw_simple_get,
++				     &fixed->hw);
++	if (ret)
++		return ret;
++
++	return devm_add_action_or_reset(qmp->dev, phy_clk_release_provider,
++					qmp->dev->of_node);
++}
++
++static int qmp_pcie_msm8994_probe(struct platform_device *pdev)
++{
++	struct qmp_pcie_msm8994 *qmp;
++	struct phy_provider *provider;
++	struct phy *phy;
++	int ret;
++
++	qmp = devm_kzalloc(&pdev->dev, sizeof(*qmp), GFP_KERNEL);
++	if (!qmp)
++		return -ENOMEM;
++
++	qmp->dev = &pdev->dev;
++	qmp->base = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(qmp->base))
++		return PTR_ERR(qmp->base);
++
++	qmp->ref = devm_clk_get(&pdev->dev, "ref");
++	if (IS_ERR(qmp->ref))
++		return PTR_ERR(qmp->ref);
++
++	qmp->ldo = devm_clk_get(&pdev->dev, "ldo");
++	if (IS_ERR(qmp->ldo))
++		return PTR_ERR(qmp->ldo);
++
++	qmp->pipe = devm_clk_get(&pdev->dev, "pipe");
++	if (IS_ERR(qmp->pipe))
++		return PTR_ERR(qmp->pipe);
++
++	qmp->reset = devm_reset_control_get_exclusive(&pdev->dev, "phy");
++	if (IS_ERR(qmp->reset))
++		return PTR_ERR(qmp->reset);
++
++	qmp->vdda = devm_regulator_get(&pdev->dev, "vdda");
++	if (IS_ERR(qmp->vdda))
++		return PTR_ERR(qmp->vdda);
++
++	ret = qmp_pcie_msm8994_register_pipe(qmp);
++	if (ret)
++		return ret;
++
++	phy = devm_phy_create(&pdev->dev, NULL, &qmp_pcie_msm8994_ops);
++	if (IS_ERR(phy))
++		return PTR_ERR(phy);
++
++	phy_set_drvdata(phy, qmp);
++
++	provider = devm_of_phy_provider_register(&pdev->dev, of_phy_simple_xlate);
++
++	return PTR_ERR_OR_ZERO(provider);
++}
++
++static const struct of_device_id qmp_pcie_msm8994_of_match[] = {
++	{ .compatible = "qcom,msm8994-qmp-pcie-phy" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, qmp_pcie_msm8994_of_match);
++
++static struct platform_driver qmp_pcie_msm8994_driver = {
++	.probe	= qmp_pcie_msm8994_probe,
++	.driver	= {
++		.name = "qcom-qmp-msm8994-pcie-phy",
++		.of_match_table = qmp_pcie_msm8994_of_match,
++	},
++};
++module_platform_driver(qmp_pcie_msm8994_driver);
++
++MODULE_DESCRIPTION("Qualcomm MSM8994 20nm QMP PCIe PHY");
++MODULE_LICENSE("GPL");

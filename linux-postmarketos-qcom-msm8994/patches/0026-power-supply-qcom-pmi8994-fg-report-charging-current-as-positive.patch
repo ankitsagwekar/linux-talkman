@@ -1,0 +1,57 @@
+From 4dd2468bc2e165a19f0e974598c9cd8d7e2fc5d9 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Tue, 6 Oct 2026 13:07:19 +0000
+Subject: [PATCH] power: supply: qcom-pmi8994-fg: report charging current as
+ positive
+
+FG_DATA_CURRENT and the termination-current encoder treat charge as
+negative. PATCH_NEG_CURRENT_BIT keeps that SRAM convention, so the
+raw sign made UPower treat charging as discharge.
+
+Negate once in fg_current_ua(). current_now is the only caller, so
+userspace sees charging as positive and discharging as negative.
+
+Co-authored-by: EpicLPer <epiclper7@gmail.com>
+---
+ drivers/power/supply/qcom-pmi8994-fg.c | 14 +++++++-------
+ 1 file changed, 7 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/power/supply/qcom-pmi8994-fg.c b/drivers/power/supply/qcom-pmi8994-fg.c
+index 8da541a9f660e4..f5a14b05da9114 100644
+--- a/drivers/power/supply/qcom-pmi8994-fg.c
++++ b/drivers/power/supply/qcom-pmi8994-fg.c
+@@ -422,9 +422,10 @@ static int fg_voltage_uv(struct pmi8994_fg *fg, int *uv)
+ 
+ /*
+  * QPNP FG_DATA_CURRENT. The sample is the s16 at VOLTAGE_ADDR offset 3
+- * (0x5cc, 3). LSB_16B is 152.587 uA, the same weight as voltage, and the
+- * value is already signed. PMI8994 sets PATCH_NEG_CURRENT_BIT so discharge
+- * stays negative.
++ * (0x5cc, 3). LSB_16B is 152.587 uA, the same weight as voltage. The SRAM
++ * sample and the termination-current encoder treat charge as negative
++ * (PATCH_NEG_CURRENT_BIT keeps that convention), so negate for current_now.
++ * Userspace then sees charging as positive and discharging as negative.
+  */
+ static int fg_current_ua(struct pmi8994_fg *fg, int *ua)
+ {
+@@ -436,7 +437,7 @@ static int fg_current_ua(struct pmi8994_fg *fg, int *ua)
+ 	if (rc)
+ 		return rc;
+ 	sraw = (s16)raw;
+-	*ua = div_s64((s64)sraw * LSB_16B_NUM, LSB_16B_DEN);
++	*ua = -div_s64((s64)sraw * LSB_16B_NUM, LSB_16B_DEN);
+ 	return 0;
+ }
+ 
+@@ -758,9 +759,8 @@ static int fg_get_property(struct power_supply *psy,
+ 		if (rc)
+ 			return rc;
+ 		/*
+-		 * Signed uA, negative for discharge. The SRAM value is an
+-		 * s16 and PMI8994 sets PATCH_NEG_CURRENT_BIT so that sign
+-		 * is the one the block reports.
++		 * Signed microamps. fg_current_ua() already negated the
++		 * SRAM sample, so charging is positive here.
+ 		 */
+ 		val->intval = fg->current_ua;
+ 		return 0;
