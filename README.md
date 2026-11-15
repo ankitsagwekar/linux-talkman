@@ -48,6 +48,11 @@ Install guide for the postmarketOS **v26.06** (stable) port in this folder.
 - A **Windows PC** (Part 1 only)
 - A **Linux PC** (Parts 2 and 3), about 35 GB free for the backup
 - A good USB-C **data** cable
+- Prebuilt kernel files (kernel package, `vmlinuz`, device tree, BootShim,
+  GRUB config) are on the GitHub release page
+  (<https://github.com/ankitsagwekar/linux-talkman/releases>). The release
+  has no root image, because the image carries the builder's account. Build
+  your own with Part 2.
 - The two images from the Linux PC:
   - `microsoft-talkman-boot.img` (512 MB)
   - `microsoft-talkman-root.img` (about 844 MB)
